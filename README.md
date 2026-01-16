@@ -20,6 +20,10 @@ comic translator, speech bubble translator, manga translator, OCR, Vision, LLM, 
 
 ## 安装（Installation）
 
+0. 第一次使用需要创建本地配置：
+   - 将 `config.example.json` 重命名为 `config.json`
+   - 打开 `config.json`，填写你的 `api_key` / `base_url` / `model`
+
 1. 安装 Python 3.10+。
 2. 安装依赖：
    ```
@@ -33,6 +37,10 @@ comic translator, speech bubble translator, manga translator, OCR, Vision, LLM, 
    pip install -r requirements.txt
    ```
    *Note: If PaddleOCR installation fails, you may need C++ Build Tools; wheels are usually available.*
+
+0. First-time setup (local config):
+   - Rename `config.example.json` to `config.json`
+   - Fill in `api_key` / `base_url` / `model` in `config.json`
 
 ## 使用（Usage）
 
@@ -59,10 +67,14 @@ comic translator, speech bubble translator, manga translator, OCR, Vision, LLM, 
 ## 推荐用法：直接用 Vision 模型（Recommended: Vision-First）
 
 - 推荐直接启用 “Enable Vision”，让支持图片识别的 LLM 直接读图翻译，通常比本地 OCR 预热/识别更快，也能绕开艺术字、复杂背景导致的 OCR 误识别。
-- 实测上手最省心的选择之一是 **Gemini 2.5 Flash Lite**：速度快、价格低、质量足够日常漫画对话使用。
+- 日常性价比优先：**Gemini 2.5 Flash Lite**（足够好、响应快、便宜）
+- 追求更好的翻译效果：**Gemini 3 Flash Preview**（质量更强，但通常更贵、速度也会慢一点）
+- 你也可以按自己偏好选择其它支持 Vision 的模型（Claude/GPT/Grok 等）
 
 - We recommend turning on “Enable Vision” so a Vision-capable LLM reads the crop and translates directly. This is often faster than waiting for local OCR and can handle stylized fonts / complex backgrounds better.
-- A practical default is **Gemini 2.5 Flash Lite**: fast, inexpensive, and good enough for everyday comic dialogue.
+- Best value for daily use: **Gemini 2.5 Flash Lite** (fast, cheap, and good enough)
+- Best quality: **Gemini 3 Flash Preview** (better quality, usually higher cost and slightly slower)
+- You can also pick any other Vision-capable model you like (Claude / GPT / Grok, etc.)
 
 ## GitHub SEO（建议）
 
@@ -90,7 +102,7 @@ comic translator, speech bubble translator, manga translator, OCR, Vision, LLM, 
 ![多气泡翻译 / Multi-bubble Translation](file/多气泡翻译.png)
 
 ### 多气泡翻译结果（Multi-bubble Result）
-![多气泡翻译结果 / Multi-bubble Result](file/多气泡翻译结果.png)
+![多气泡翻译结果（来自 Gemini 3 Flash Preview）/ Multi-bubble Result (Gemini 3 Flash Preview)](file/多气泡翻译结果_来自gemini-3-flash-preview.png)
 
 ### 消费记录（Usage / Cost）
 ![Usage / Cost](file/Usage.png)
