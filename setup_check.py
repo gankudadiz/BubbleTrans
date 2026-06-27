@@ -4,11 +4,8 @@ import importlib.util
 
 REQUIRED_PACKAGES = {
     "PyQt6": "PyQt6",
-    "paddleocr": "paddleocr",
-    "paddle": "paddlepaddle",
     "openai": "openai",
-    "PIL": "Pillow",
-    "requests": "requests"
+    "PIL": "Pillow"
 }
 
 def check_package(package_name, install_name):

@@ -1,5 +1,7 @@
 # BubbleTrans（Scrappy Comic Translator）v1.0 初始化项目文档
 
+> **状态：已交付（v1.0）。** v2.0 重构设计中，详见 [`docs/01_项目规划与设计/2026-06-28-BubbleTrans-v2.0-重构设计方案.md`](01_项目规划与设计/2026-06-28-BubbleTrans-v2.0-重构设计方案.md)。
+
 ## 1. 项目简介
 
 BubbleTrans 是一个基于 Python + PyQt6 的桌面端美漫翻译辅助工具，面向“看图框选气泡 -> OCR -> 调用大模型翻译”的高频工作流。

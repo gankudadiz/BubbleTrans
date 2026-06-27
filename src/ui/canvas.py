@@ -170,6 +170,7 @@ class ImageCanvas(QGraphicsView):
         
         # 加载图片
         self.current_pixmap = QPixmap(image_path)
+        self._current_image_path = image_path  # 存储当前图片路径
         
         # 创建图片图形项并添加到场景
         self.pixmap_item = QGraphicsPixmapItem(self.current_pixmap)

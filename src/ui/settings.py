@@ -138,7 +138,7 @@ class SettingsDialog(QDialog):
         """
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.resize(500, 300)
+        self.resize(520, 380)
         self.init_ui()
     
     # ===================== 模型历史记录管理 =====================
@@ -250,12 +250,9 @@ class SettingsDialog(QDialog):
         
         # ===== Vision模式复选框 =====
         self.vision_check = QCheckBox("Enable Vision (Send Image to LLM)")
-        self.vision_check.setToolTip(
-            "Check this if your model supports image input "
-            "(e.g. GPT-4o, Claude 3.5, Gemini)"
-        )
-        # 从引擎读取当前状态
-        self.vision_check.setChecked(getattr(llm_engine, 'use_vision', False))
+        self.vision_check.setChecked(True)   # 始终勾选
+        self.vision_check.setEnabled(False)  # 禁用，不可取消
+        self.vision_check.setToolTip("v2.0 纯多模态架构，Vision 始终启用")
         
         # ===== 添加到表单 =====
         form.addRow("API Key:", self.api_key_edit)
@@ -263,13 +260,20 @@ class SettingsDialog(QDialog):
         form.addRow("Model Name:", self.model_combo)
         form.addRow("", self.vision_check)  # 空标签，复选框单独一行
         
+        # ===== 目标语言下拉框 =====
+        self.lang_combo = QComboBox()
+        self.lang_combo.addItems(["简体中文", "繁體中文", "日本語", "한국어", "English", "Français"])
+        # 从引擎读取当前语言
+        current_lang = getattr(llm_engine, 'target_lang', '简体中文')
+        idx = self.lang_combo.findText(current_lang)
+        if idx >= 0:
+            self.lang_combo.setCurrentIndex(idx)
+        form.addRow("目标语言:", self.lang_combo)
+        
         layout.addLayout(form)
         
         # ===== 提示信息 =====
-        hint = QLabel(
-            "Note: If using DeepSeek or other text-only models, "
-            "uncheck 'Enable Vision'."
-        )
+        hint = QLabel("v2.0 纯多模态架构，所有翻译均通过图片+LLM完成")
         hint.setStyleSheet("color: gray; font-size: 10px;")
         layout.addWidget(hint)
         
@@ -367,13 +371,15 @@ class SettingsDialog(QDialog):
         
         # 临时方案：将Vision设置存储在引擎实例上
         llm_engine.use_vision = self.vision_check.isChecked()
+        llm_engine.target_lang = self.lang_combo.currentText().strip()
         
         # 保存到配置文件
         save_config({
             "api_key": api_key,
             "base_url": llm_engine.base_url,
             "model": llm_engine.model,
-            "use_vision": llm_engine.use_vision
+            "use_vision": True,
+            "target_lang": llm_engine.target_lang
         })
         
         # 关闭对话框
