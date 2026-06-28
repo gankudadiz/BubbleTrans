@@ -156,13 +156,15 @@ class ImageCanvas(QGraphicsView):
         self.pan_start = QPoint()       # 平移开始时的鼠标位置
         
         # ===== 导航覆盖层 =====
-        # 半透明按钮浮在画布上，hover 时显现
-        # 按钮实例待后续启用（当前通过键盘方向键翻页）
+        # 按钮仅做键盘方向键翻页，不显示 UI 控件
         self._btn_prev = None
         self._btn_next = None
         self._lbl_page = None
         self._nav_visible = False
         self._nav_hide_timer = None
+        
+        # 接受键盘焦点，以支持左右方向键翻页
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
     
     def load_image(self, image_path, pixmap=None):
         """
@@ -250,13 +252,13 @@ class ImageCanvas(QGraphicsView):
         self.setMouseTracking(True)
         
         # --- 前翻按钮 ---
-        self._btn_prev = QPushButton("◀", viewport)
+        self._btn_prev = QPushButton("<", viewport)
         self._btn_prev.setFixedSize(44, 44)
         self._btn_prev.setCursor(Qt.CursorShape.ArrowCursor)
         self._btn_prev.clicked.connect(self.nav_prev.emit)
         
         # --- 后翻按钮 ---
-        self._btn_next = QPushButton("▶", viewport)
+        self._btn_next = QPushButton(">", viewport)
         self._btn_next.setFixedSize(44, 44)
         self._btn_next.setCursor(Qt.CursorShape.ArrowCursor)
         self._btn_next.clicked.connect(self.nav_next.emit)
@@ -283,33 +285,34 @@ class ImageCanvas(QGraphicsView):
         self._reposition_nav_overlay()
     
     def _apply_nav_styles(self):
-        """为导航按钮和页码指示器应用统一样式表"""
+        """为导航按钮和页码指示器应用统一样式表（避免 rgba 确保兼容性）"""
         btn_style = """
         QPushButton {
-            background-color: rgba(20, 20, 20, 100);
-            color: rgba(255, 255, 255, 180);
-            border: 1px solid rgba(255, 255, 255, 25);
+            background-color: #1e1e1e;
+            color: #cccccc;
+            border: 1px solid #555555;
             border-radius: 22px;
             font-size: 18px;
+            font-weight: bold;
         }
         QPushButton:hover {
-            background-color: rgba(40, 40, 40, 200);
-            color: rgba(255, 255, 255, 255);
-            border: 1px solid rgba(255, 255, 255, 60);
+            background-color: #3a3a3a;
+            color: #ffffff;
+            border: 1px solid #888888;
         }
         QPushButton:pressed {
-            background-color: rgba(60, 60, 60, 230);
+            background-color: #505050;
         }
         QPushButton:disabled {
-            background-color: rgba(20, 20, 20, 50);
-            color: rgba(255, 255, 255, 40);
-            border: 1px solid rgba(255, 255, 255, 8);
+            background-color: #1a1a1a;
+            color: #444444;
+            border: 1px solid #333333;
         }
         """
         lbl_style = """
         QLabel {
-            background-color: rgba(20, 20, 20, 100);
-            color: rgba(255, 255, 255, 180);
+            background-color: #1e1e1e;
+            color: #cccccc;
             border-radius: 10px;
             padding: 4px 12px;
             font-size: 13px;
