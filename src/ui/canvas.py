@@ -31,7 +31,10 @@ from PyQt6.QtWidgets import (
     QGraphicsView,      # 图形视图控件，提供查看和操作图形场景的界面
     QGraphicsScene,     # 图形场景，管理图形项的容器
     QGraphicsPixmapItem, # 图形项，用于显示图片
+    QGraphicsTextItem,  # 图形文本项，用于显示占位文字
     QRubberBand,        # 橡皮筋选择框，显示矩形选区
+    QPushButton,        # 按钮控件（导航箭头）
+    QLabel,             # 标签控件（页码指示器）
     QWidget             # 基础窗口部件
 )
 
@@ -42,7 +45,8 @@ from PyQt6.QtCore import (
     QPoint,            # 坐标点类
     pyqtSignal,        # 信号定义
     QSize,             # 尺寸类
-    QRect              # 整数矩形
+    QRect,             # 整数矩形
+    QTimer             # 定时器（导航按钮延时隐藏）
 )
 
 # 从QtGui导入图形相关类
@@ -50,7 +54,8 @@ from PyQt6.QtGui import (
     QPixmap,           # 图片类，用于显示图像数据
     QPainter,          # 画家类，用于渲染设置
     QWheelEvent,       # 滚轮事件
-    QMouseEvent        # 鼠标事件
+    QMouseEvent,       # 鼠标事件
+    QKeyEvent          # 键盘事件（方向键翻页）
 )
 
 
@@ -85,6 +90,10 @@ class ImageCanvas(QGraphicsView):
     
     # 定义信号：当完成区域选择时发射，参数为裁剪后的图片
     region_selected = pyqtSignal(QPixmap)
+    
+    # 导航信号：前后翻页（由 MainWindow 连接处理）
+    nav_prev = pyqtSignal()
+    nav_next = pyqtSignal()
     
     def __init__(self, parent=None):
         """
@@ -145,8 +154,17 @@ class ImageCanvas(QGraphicsView):
         # ===== 平移状态 =====
         self.is_panning = False         # 是否正在平移
         self.pan_start = QPoint()       # 平移开始时的鼠标位置
+        
+        # ===== 导航覆盖层 =====
+        # 半透明按钮浮在画布上，hover 时显现
+        # 按钮实例待后续启用（当前通过键盘方向键翻页）
+        self._btn_prev = None
+        self._btn_next = None
+        self._lbl_page = None
+        self._nav_visible = False
+        self._nav_hide_timer = None
     
-    def load_image(self, image_path):
+    def load_image(self, image_path, pixmap=None):
         """
         加载图片
         
@@ -154,11 +172,13 @@ class ImageCanvas(QGraphicsView):
         
         参数:
             image_path: 图片文件的路径（绝对路径或相对路径）
+            pixmap:     可选，预解码好的QPixmap（用于缓存命中场景）
+                        为None时从文件路径同步解码
             
         操作步骤：
         1. 清空场景
         2. 重置变换（缩放比例）
-        3. 加载图片文件创建QPixmap
+        3. 加载图片（优先使用传入的pixmap，否则从文件解码）
         4. 创建图形项添加到场景
         5. 设置场景大小为图片大小
         6. 缩放以适应窗口（保持宽高比）
@@ -168,8 +188,11 @@ class ImageCanvas(QGraphicsView):
         self.resetTransform()           # 重置所有变换（缩放、旋转等）
         self.has_user_transform = False # 重置用户变换标记
         
-        # 加载图片
-        self.current_pixmap = QPixmap(image_path)
+        # 加载图片：优先使用缓存的pixmap，否则从文件解码
+        if pixmap is not None:
+            self.current_pixmap = pixmap
+        else:
+            self.current_pixmap = QPixmap(image_path)
         self._current_image_path = image_path  # 存储当前图片路径
         
         # 创建图片图形项并添加到场景
@@ -184,6 +207,183 @@ class ImageCanvas(QGraphicsView):
         
         # 居中显示图片
         self.centerOn(self.pixmap_item)
+    
+    def show_placeholder(self, text="加载中…"):
+        """
+        显示占位文字（在异步解码期间展示）
+        
+        清空场景并居中显示提示文字，避免"白屏等待"的体验
+        
+        参数:
+            text: 提示文字内容
+        """
+        self.scene.clear()
+        self.resetTransform()
+        self.has_user_transform = False
+        self.current_pixmap = None
+        self.pixmap_item = None
+        self._current_image_path = None
+        
+        # 创建居中文本项
+        text_item = QGraphicsTextItem(text)
+        font = text_item.font()
+        font.setPointSize(18)
+        text_item.setFont(font)
+        text_item.setDefaultTextColor(Qt.GlobalColor.white)
+        self.scene.addItem(text_item)
+        
+        # 以文本边界设置场景矩形并居中
+        self.setSceneRect(self.scene.itemsBoundingRect())
+        self.fitInView(self.scene.itemsBoundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.centerOn(text_item)
+        # 占位时隐藏页码指示器
+        if self._lbl_page is not None:
+            self._lbl_page.hide()
+    
+    # ===================== 导航覆盖层 =====================
+    
+    def _setup_nav_overlay(self):
+        """创建半透明导航按钮和页码指示器（浮在画布上方）"""
+        viewport = self.viewport()
+        
+        # 设置画布的鼠标追踪（用于 hover 显示导航按钮）
+        self.setMouseTracking(True)
+        
+        # --- 前翻按钮 ---
+        self._btn_prev = QPushButton("◀", viewport)
+        self._btn_prev.setFixedSize(44, 44)
+        self._btn_prev.setCursor(Qt.CursorShape.ArrowCursor)
+        self._btn_prev.clicked.connect(self.nav_prev.emit)
+        
+        # --- 后翻按钮 ---
+        self._btn_next = QPushButton("▶", viewport)
+        self._btn_next.setFixedSize(44, 44)
+        self._btn_next.setCursor(Qt.CursorShape.ArrowCursor)
+        self._btn_next.clicked.connect(self.nav_next.emit)
+        
+        # --- 页码指示器 ---
+        self._lbl_page = QLabel("", viewport)
+        self._lbl_page.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        # --- 统一样式 ---
+        self._apply_nav_styles()
+        
+        # --- 初始隐藏，hover 时浮现 ---
+        self._nav_visible = False
+        self._btn_prev.hide()
+        self._btn_next.hide()
+        self._lbl_page.hide()
+        
+        # --- 延时隐藏定时器 ---
+        self._nav_hide_timer = QTimer(self)
+        self._nav_hide_timer.setSingleShot(True)
+        self._nav_hide_timer.timeout.connect(self._hide_nav_overlay)
+        
+        # --- 位置更新 ---
+        self._reposition_nav_overlay()
+    
+    def _apply_nav_styles(self):
+        """为导航按钮和页码指示器应用统一样式表"""
+        btn_style = """
+        QPushButton {
+            background-color: rgba(20, 20, 20, 100);
+            color: rgba(255, 255, 255, 180);
+            border: 1px solid rgba(255, 255, 255, 25);
+            border-radius: 22px;
+            font-size: 18px;
+        }
+        QPushButton:hover {
+            background-color: rgba(40, 40, 40, 200);
+            color: rgba(255, 255, 255, 255);
+            border: 1px solid rgba(255, 255, 255, 60);
+        }
+        QPushButton:pressed {
+            background-color: rgba(60, 60, 60, 230);
+        }
+        QPushButton:disabled {
+            background-color: rgba(20, 20, 20, 50);
+            color: rgba(255, 255, 255, 40);
+            border: 1px solid rgba(255, 255, 255, 8);
+        }
+        """
+        lbl_style = """
+        QLabel {
+            background-color: rgba(20, 20, 20, 100);
+            color: rgba(255, 255, 255, 180);
+            border-radius: 10px;
+            padding: 4px 12px;
+            font-size: 13px;
+        }
+        """
+        self._btn_prev.setStyleSheet(btn_style)
+        self._btn_next.setStyleSheet(btn_style)
+        self._lbl_page.setStyleSheet(lbl_style)
+    
+    def _reposition_nav_overlay(self):
+        """根据视口大小重新定位导航按钮和页码指示器"""
+        if self._btn_prev is None:
+            return
+        vp = self.viewport()
+        w, h = vp.width(), vp.height()
+        self._btn_prev.move(10, (h - 44) // 2)
+        self._btn_next.move(w - 54, (h - 44) // 2)
+        self._lbl_page.adjustSize()
+        lw = self._lbl_page.width()
+        self._lbl_page.move((w - lw) // 2, h - 36)
+    
+    def _show_nav_overlay(self):
+        """浮现导航按钮（鼠标进入画布时调用）"""
+        if self._btn_prev is None:
+            return
+        if self._nav_visible:
+            return
+        self._nav_visible = True
+        self._nav_hide_timer.stop()
+        self._btn_prev.show()
+        self._btn_next.show()
+        if self._current_image_path:
+            self._lbl_page.show()
+    
+    def _hide_nav_overlay(self):
+        """隐藏导航按钮（鼠标离开画布 500ms 后调用）"""
+        if self._btn_prev is None:
+            return
+        self._nav_visible = False
+        self._btn_prev.hide()
+        self._btn_next.hide()
+        self._lbl_page.hide()
+    
+    def update_page_indicator(self, current: int, total: int):
+        """更新页码指示器文本（"3 / 25" 格式）"""
+        if self._lbl_page is None:
+            return
+        self._lbl_page.setText(f"{current} / {total}")
+        self._reposition_nav_overlay()
+        if self._nav_visible and self._current_image_path:
+            self._lbl_page.show()
+    
+    # ===================== 事件处理 =====================
+    
+    def enterEvent(self, event):
+        """鼠标进入画布：浮现导航覆盖层"""
+        if self._btn_prev is not None:
+            self._show_nav_overlay()
+        super().enterEvent(event)
+    
+    def leaveEvent(self, event):
+        """鼠标离开画布：延时隐藏导航覆盖层"""
+        if self._btn_prev is not None:
+            self._nav_hide_timer.start(500)
+        super().leaveEvent(event)
+    
+    def keyPressEvent(self, event: QKeyEvent):
+        """键盘事件：左右方向键翻页"""
+        if event.key() == Qt.Key.Key_Left:
+            self.nav_prev.emit()
+        elif event.key() == Qt.Key.Key_Right:
+            self.nav_next.emit()
+        else:
+            super().keyPressEvent(event)
     
     def wheelEvent(self, event: QWheelEvent):
         """
@@ -354,6 +554,9 @@ class ImageCanvas(QGraphicsView):
         
         # 调用父类的resizeEvent
         super().resizeEvent(event)
+        
+        # 更新导航覆盖层位置（按钮 + 页码指示器）
+        self._reposition_nav_overlay()
         
         if not self.pixmap_item:
             return

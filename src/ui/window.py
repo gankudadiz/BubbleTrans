@@ -60,6 +60,7 @@ from PyQt6.QtCore import (
 # ============================================================================
 import os               # 文件路径操作
 import tempfile         # 临时文件目录
+from collections import OrderedDict  # LRU缓存
 
 # ============================================================================
 # 项目内部模块导入
@@ -118,6 +119,41 @@ class TranslationWorker(QThread):
             self.finished.emit(origin_text, translated_text)
         except Exception as e:
             self.error.emit(str(e))
+
+
+# ============================================================================
+# ImageLoadWorker 类 - 图片异步解码线程
+# ============================================================================
+# 继承自QThread，在后台线程中解码QPixmap，避免主线程卡顿
+#
+# 为什么需要异步解码？
+# - 漫画扫描页通常 4000×6000 像素，QPixmap 解码需 200-800ms
+# - 在主线程解码会导致整个窗口冻结
+# - 后台解码 + 占位文字 = 流畅体验
+#
+# 信号说明：
+# - loaded: 解码完成时发射 (image_path, QPixmap)
+# - error:  解码失败时发射 (image_path, error_msg)
+# ============================================================================
+class ImageLoadWorker(QThread):
+    """后台线程：异步解码图片文件为 QPixmap"""
+    loaded = pyqtSignal(str, QPixmap)  # image_path, pixmap
+    error = pyqtSignal(str, str)       # image_path, error_msg
+    
+    def __init__(self, image_path):
+        super().__init__()
+        self.image_path = image_path
+    
+    def run(self):
+        """在后台线程中执行 QPixmap 解码"""
+        try:
+            pixmap = QPixmap(self.image_path)
+            if pixmap.isNull():
+                self.error.emit(self.image_path, f"无法解码: {self.image_path}")
+            else:
+                self.loaded.emit(self.image_path, pixmap)
+        except Exception as e:
+            self.error.emit(self.image_path, str(e))
 
 
 # ============================================================================
@@ -212,6 +248,14 @@ class MainWindow(QMainWindow):
         self.current_folder = ""      # 当前打开的文件夹路径
         self.worker = None            # 翻译工作线程实例
         
+        # === 图片缓存与异步加载 ===
+        # LRU缓存：最多缓存10张已解码的 QPixmap，翻回同一页秒开
+        self.pixmap_cache = OrderedDict()   # path -> QPixmap
+        self.pending_loads = {}             # path -> ImageLoadWorker（防止重复加载）
+        self.current_file_index = -1        # 当前显示的文件在列表中的索引
+        self.MAX_CACHE_SIZE = 10            # 最大缓存页数
+        self.PREFETCH_RANGE = 2             # 相邻预加载范围（前后各2页）
+        
         # 初始化UI
         self.init_ui()
     
@@ -256,6 +300,8 @@ class MainWindow(QMainWindow):
         # --- 2. 图片画布（中间，自适应扩展）---
         self.canvas = ImageCanvas()
         self.canvas.region_selected.connect(self.handle_region_selected)  # 框选完成时触发
+        self.canvas.nav_prev.connect(self._nav_prev_page)                 # ← 前翻页
+        self.canvas.nav_next.connect(self._nav_next_page)                 # → 后翻页
         splitter.addWidget(self.canvas)
         
         # --- 3. 翻译面板（右侧，固定宽度300px）---
@@ -310,6 +356,7 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Select Comic Folder")
         if folder:
             self.current_folder = folder
+            self._clear_image_cache()   # 切换文件夹时清空旧缓存
             self.load_file_list()
             self.status_bar.showMessage(f"Loaded folder: {folder}")
     
@@ -336,17 +383,157 @@ class MainWindow(QMainWindow):
     
     def load_image(self, item):
         """
-        加载图片到画布
-        
+        加载图片到画布（带 LRU 缓存 + 异步解码 + 预加载）
+
         当用户点击文件列表中的某个文件时调用
-        
+
+        优化策略：
+        1. 命中 LRU 缓存 → 直接显示（秒开）
+        2. 未命中 → 显示"加载中…"占位，后台线程异步解码
+        3. 解码完成后自动触发相邻页预加载
+
         参数:
             item: 点击的列表项（QListWidgetItem）
         """
         file_name = item.text()
         file_path = os.path.join(self.current_folder, file_name)
-        self.status_bar.showMessage(f"Selected: {file_name}")
-        self.canvas.load_image(file_path)
+        self.current_file_index = self.file_list.currentRow()
+        
+        # 立即更新页码和按钮状态（不等图片解码）
+        self._update_page_info()
+        
+        # === 第一步：检查 LRU 缓存 ===
+        if file_path in self.pixmap_cache:
+            pixmap = self.pixmap_cache[file_path]
+            self.pixmap_cache.move_to_end(file_path)  # 更新 LRU 位置（标记最近使用）
+            self.status_bar.showMessage(f"选中: {file_name} (缓存命中)")
+            self.canvas.load_image(file_path, pixmap=pixmap)
+            self._update_page_info()   # 刷新页码（_current_image_path 已正确设置）
+            self._set_translating(False)
+            self._prefetch_adjacent()  # 仍然预加载相邻页
+            return
+        
+        # === 第二步：未命中缓存，异步加载 ===
+        self.canvas.show_placeholder("加载中…")
+        self.status_bar.showMessage(f"加载中: {file_name}…")
+        self._set_translating(False)
+        
+        # 启动后台解码线程
+        worker = ImageLoadWorker(file_path)
+        worker.loaded.connect(self._on_image_loaded)
+        worker.error.connect(self._on_image_load_error)
+        self.pending_loads[file_path] = worker
+        worker.start()
+    
+    # ===================== 图片缓存与异步加载辅助方法 =====================
+    
+    def _on_image_loaded(self, image_path, pixmap):
+        """异步图片解码完成回调 —— 加入缓存并渲染到画布"""
+        self._add_to_cache(image_path, pixmap)
+        self.pending_loads.pop(image_path, None)
+        
+        # 仅当用户没有在此间切到其他页时才渲染
+        current_item = self.file_list.currentItem()
+        if current_item:
+            current_path = os.path.join(self.current_folder, current_item.text())
+            if image_path == current_path:
+                self.canvas.load_image(image_path, pixmap=pixmap)
+                self.status_bar.showMessage(f"已加载: {os.path.basename(image_path)}")
+                self._update_page_info()   # 刷新页码指示器
+                self._prefetch_adjacent()
+    
+    def _on_image_load_error(self, image_path, error_msg):
+        """异步图片解码失败回调"""
+        self.pending_loads.pop(image_path, None)
+        current_item = self.file_list.currentItem()
+        if current_item:
+            current_path = os.path.join(self.current_folder, current_item.text())
+            if image_path == current_path:
+                self.canvas.show_placeholder(f"加载失败: {error_msg}")
+                self.status_bar.showMessage(f"错误: {error_msg}")
+    
+    def _add_to_cache(self, path, pixmap):
+        """向 LRU 缓存添加一条记录，超过上限时自动淘汰最旧的"""
+        if path in self.pixmap_cache:
+            self.pixmap_cache.move_to_end(path)
+        self.pixmap_cache[path] = pixmap
+        if len(self.pixmap_cache) > self.MAX_CACHE_SIZE:
+            # popitem(last=False) 弹出最旧的（最先插入的）
+            self.pixmap_cache.popitem(last=False)
+    
+    def _prefetch_adjacent(self):
+        """预加载当前页前后的相邻页面到缓存"""
+        if self.current_file_index < 0:
+            return
+        total = self.file_list.count()
+        for offset in range(1, self.PREFETCH_RANGE + 1):
+            for idx in (self.current_file_index + offset, self.current_file_index - offset):
+                if 0 <= idx < total:
+                    file_path = os.path.join(self.current_folder,
+                                             self.file_list.item(idx).text())
+                    # 跳过已缓存或正在加载的
+                    if file_path in self.pixmap_cache or file_path in self.pending_loads:
+                        continue
+                    worker = ImageLoadWorker(file_path)
+                    worker.loaded.connect(self._on_prefetch_loaded)
+                    # 预加载错误静默忽略
+                    worker.error.connect(lambda p, e: self.pending_loads.pop(p, None))
+                    self.pending_loads[file_path] = worker
+                    worker.start()
+    
+    def _on_prefetch_loaded(self, image_path, pixmap):
+        """预加载完成回调 —— 静默加入缓存，不渲染到画布"""
+        self._add_to_cache(image_path, pixmap)
+        self.pending_loads.pop(image_path, None)
+    
+    def _clear_image_cache(self):
+        """清空所有图片缓存和进行中的加载（切换文件夹时调用）"""
+        self.pixmap_cache.clear()
+        # 终止所有进行中的后台解码线程
+        for path, worker in list(self.pending_loads.items()):
+            if worker.isRunning():
+                worker.terminate()
+        self.pending_loads.clear()
+        self.current_file_index = -1
+        # 隐藏导航按钮和页码指示器
+        self.canvas._hide_nav_overlay()
+    
+    # ===================== 页面导航 =====================
+    
+    def _nav_prev_page(self):
+        """← 前翻页（由画布箭头按钮或键盘左方向键触发）"""
+        self._navigate_page(-1)
+    
+    def _nav_next_page(self):
+        """→ 后翻页（由画布箭头按钮或键盘右方向键触发）"""
+        self._navigate_page(1)
+    
+    def _navigate_page(self, delta: int):
+        """执行翻页：修改文件列表选中项并触发图片加载"""
+        count = self.file_list.count()
+        if count == 0:
+            return
+        current = self.file_list.currentRow()
+        new_row = current + delta
+        if 0 <= new_row < count:
+            self.file_list.setCurrentRow(new_row)
+            item = self.file_list.item(new_row)
+            self.load_image(item)
+    
+    def _update_page_info(self):
+        """刷新画布上的页码指示器和按钮可用状态"""
+        count = self.file_list.count()
+        if count == 0:
+            return
+        current = self.file_list.currentRow()
+        if current >= 0:
+            self.canvas.update_page_indicator(current + 1, count)
+        # 首页禁用前翻，末页禁用后翻（仅当按钮已初始化时）
+        if self.canvas._btn_prev is not None:
+            self.canvas._btn_prev.setEnabled(current > 0)
+            self.canvas._btn_next.setEnabled(current < count - 1)
+    
+    # ===================== 设置对话框 =====================
     
     def open_settings(self):
         """
@@ -376,6 +563,7 @@ class MainWindow(QMainWindow):
             return
         
         # 用户确认后，开始处理
+        self._set_translating(True)
         self.status_bar.showMessage("翻译中...")
         # 临时更新面板标签
         self.origin_text_edit.setPlaceholderText("▼ 框选原文")
@@ -412,6 +600,7 @@ class MainWindow(QMainWindow):
         """
         self.origin_text_edit.setText(origin_text)
         self.trans_text_edit.setText(translated_text)
+        self._set_translating(False)
         self.status_bar.showMessage("翻译完成", 5000)
     
     def on_translation_error(self, error_msg):
@@ -424,15 +613,29 @@ class MainWindow(QMainWindow):
             error_msg: 错误信息
         """
         self.status_bar.showMessage(f"错误: {error_msg}")
+        self._set_translating(False)
         QMessageBox.warning(self, "翻译失败", error_msg)
+    
+    def _set_translating(self, active: bool):
+        """设置翻译进行中状态，防止重复点击"""
+        self.translate_page_btn.setEnabled(not active)
+        if active:
+            self.translate_page_btn.setText("翻译中…")
+        else:
+            self.translate_page_btn.setText("翻译当前页")
+            # 如果有进行中的 worker，终止它
+            if self.worker and self.worker.isRunning():
+                self.worker.terminate()
+                self.worker = None
     
     def translate_current_page(self):
         """翻译当前画布中显示的整张图片"""
-        if not hasattr(self.canvas, '_current_image_path'):
+        if not hasattr(self.canvas, '_current_image_path') or not self.canvas._current_image_path:
             self.status_bar.showMessage("请先打开一张图片", 3000)
             return
         
         image_path = self.canvas._current_image_path
+        self._set_translating(True)
         self.status_bar.showMessage("翻译中…")
         self.origin_text_edit.clear()
         self.trans_text_edit.clear()
@@ -443,3 +646,12 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self.on_translation_finished)
         self.worker.error.connect(self.on_translation_error)
         self.worker.start()
+    
+    def keyPressEvent(self, event):
+        """键盘快捷键：左右方向键翻页（画布未聚焦时也可用）"""
+        if event.key() == Qt.Key.Key_Left:
+            self._nav_prev_page()
+        elif event.key() == Qt.Key.Key_Right:
+            self._nav_next_page()
+        else:
+            super().keyPressEvent(event)

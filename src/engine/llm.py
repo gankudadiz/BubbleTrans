@@ -99,37 +99,99 @@ class LLMEngine:
         self.target_lang = "简体中文"                            # 默认目标语言
         self.use_vision = True                                  # v2.0 始终使用Vision模式
         self.client = None                                      # OpenAI客户端实例
+        self.active_profile = "默认"                            # 当前激活的配置档案
         
         # 从配置文件加载设置
         self._load_from_config()
     
     def _load_from_config(self):
         """
-        从配置文件加载设置
+        从配置文件加载设置（支持配置档案 + 旧格式自动迁移）
         
-        读取config.json中的API配置：
-        - api_key: API密钥
-        - base_url: API服务器地址
-        - model: 模型名称
-        - target_lang: 目标语言
-        - use_vision: 是否启用Vision模式（兼容旧配置）
-        
-        如果配置有效，自动配置客户端
+        读取config.json中的API配置
         """
         config = load_config()
         
-        # 从配置获取设置，支持默认值
-        self.api_key = config.get("api_key", "")
-        self.base_url = config.get("base_url", "https://openrouter.ai/api/v1")
-        self.model = config.get("model", "google/gemini-2.0-flash-001")
+        # 通用设置
         self.target_lang = config.get("target_lang", "简体中文")
-        
-        # 兼容旧配置：如果配置中有 use_vision 字段则读取，否则默认为 True
         self.use_vision = config.get("use_vision", True)
+        
+        # ===== 自动迁移旧格式 =====
+        if "profiles" not in config:
+            # 旧格式：单套配置 → 迁移为配置档案
+            from utils.config import save_config
+            old_api_key = config.get("api_key", "")
+            old_base_url = config.get("base_url", "https://openrouter.ai/api/v1")
+            old_model = config.get("model", "google/gemini-2.0-flash-001")
+            config["profiles"] = {
+                "默认": {
+                    "api_key": old_api_key,
+                    "base_url": old_base_url,
+                    "model": old_model,
+                }
+            }
+            config["active_profile"] = "默认"
+            # 清理旧字段
+            for key in ("api_key", "base_url", "model"):
+                config.pop(key, None)
+            save_config(config)
+        
+        # ===== 加载当前档案 =====
+        self.active_profile = config.get("active_profile", "默认")
+        profiles = config.get("profiles", {})
+        profile = profiles.get(self.active_profile, {})
+        self.api_key = profile.get("api_key", "")
+        self.base_url = profile.get("base_url", "https://openrouter.ai/api/v1")
+        self.model = profile.get("model", "google/gemini-2.0-flash-001")
         
         # 如果有API密钥，配置客户端
         if self.api_key:
             self.configure(self.api_key, self.base_url, self.model)
+    
+    def get_profiles(self):
+        """获取所有配置档案"""
+        config = load_config()
+        return config.get("profiles", {})
+    
+    def switch_profile(self, name):
+        """切换到指定配置档案"""
+        config = load_config()
+        profiles = config.get("profiles", {})
+        if name in profiles:
+            config["active_profile"] = name
+            from utils.config import save_config
+            save_config(config)
+            # 重新加载
+            self._load_from_config()
+    
+    def save_profile(self, name, api_key, base_url, model):
+        """保存/更新一个配置档案"""
+        config = load_config()
+        if "profiles" not in config:
+            config["profiles"] = {}
+        config["profiles"][name] = {
+            "api_key": api_key,
+            "base_url": base_url,
+            "model": model,
+        }
+        if name == self.active_profile:
+            config["active_profile"] = name
+        from utils.config import save_config
+        save_config(config)
+    
+    def delete_profile(self, name):
+        """删除配置档案"""
+        config = load_config()
+        profiles = config.get("profiles", {})
+        if name in profiles and len(profiles) > 1:
+            del profiles[name]
+            if config.get("active_profile") == name:
+                # 切换到第一个剩余档案
+                config["active_profile"] = next(iter(profiles.keys()))
+            from utils.config import save_config
+            save_config(config)
+            # 重新加载
+            self._load_from_config()
     
     def configure(self, api_key, base_url=None, model=None):
         """
@@ -241,26 +303,39 @@ class LLMEngine:
             系统提示词字符串
         """
         lang_tag = self._get_language_tag(target_lang)
-        return f"""你是一个专业的漫画翻译助手。你的任务是：
+        return f"""你是一个专业的漫画翻译与本地化专家。你的任务是：
 1. 识别图片中所有文字，按阅读顺序整理成段落
 2. 将原文翻译成{target_lang}
+
+核心原则：译文读起来必须像中文漫画的台词，不能像翻译出来的文字。
+
+翻译风格要求：
+- 口语化：用角色会说的话，不是书面语。大声读出来如果不自然就重写
+- 角色入戏：根据上下文判断角色的性格和情绪（傲慢、愤怒、讽刺、冷漠、恐惧等），让译文字字符合人设
+- 拒绝翻译腔：不要照搬英文句式。英文的被动语态、长从句在中文里要拆开、改顺、说人话
+- 简洁有力：漫画气泡空间有限，一个气泡就是一句话，别堆修饰词
+- 善用语气词：适当使用吧、啊、呢、嘛、哦、嗯等，但不要滥用卖萌
+- 节奏感：战斗/争吵用短句快节奏，叙述/独白可稍长但不啰嗦
+- 专名一致：同一角色名、地名、组织名的译法全文统一
 
 输出格式严格要求如下（不要添加任何额外说明）：
 
 <原文>
 段落一的内容…
+
 段落二的内容…
 </原文>
 
 <{lang_tag}>
 段落一的翻译…
+
 段落二的翻译…
 </{lang_tag}>
 
 注意：
-- 每个段落之间用空行分隔
+- 严格使用空行分隔段落：每个段落之后必须跟一个空行再写下一个段落（即用两个换行符 \\n\\n，不是单个换行）
 - 原文和译文段落数量必须一一对应
-- 气泡内的拟声词（如"BAM""BOOM"）保留原样不翻译
+- 原文中的英文如全是大写（美漫常见格式），请在<原文>中转为正常大小写格式以便中文读者阅读（如"I'M GOING"→"I'm going"）。拟声词保留原样
 - 专有名词（人名、地名、组织等）：翻译为中文，并在其后用括号标注原文。不确定译名时保留原文
 - 不确定的内容保留原文并标注[?]"""
     
@@ -281,16 +356,59 @@ class LLMEngine:
         """
         lang_tag = self._get_language_tag(target_lang)
         
-        # 提取原文
-        origin_match = re.search(r'<原文>\s*\n(.*?)</原文>', response_text, re.DOTALL)
+        # 提取原文（标签后可能有或没有换行）
+        origin_match = re.search(r'<原文>\s*(.*?)</原文>', response_text, re.DOTALL)
         origin_text = origin_match.group(1).strip() if origin_match else ""
         
-        # 提取译文
-        trans_pattern = rf'<{re.escape(lang_tag)}>\s*\n(.*?)</{re.escape(lang_tag)}>'
+        # 提取译文（标签后可能有或没有换行）
+        trans_pattern = rf'<{re.escape(lang_tag)}>\s*(.*?)</{re.escape(lang_tag)}>'
         trans_match = re.search(trans_pattern, response_text, re.DOTALL)
         translated_text = trans_match.group(1).strip() if trans_match else ""
         
+        # 后处理：强制段落分隔 + 大小写归一化
+        origin_text = self._normalize_paragraphs(origin_text)
+        translated_text = self._normalize_paragraphs(translated_text)
+        origin_text = self._normalize_case(origin_text)
+        
         return origin_text, translated_text
+    
+    def _normalize_paragraphs(self, text):
+        """确保段落间用空行分隔（兼容模型不遵循指令的情况）"""
+        if not text:
+            return text
+        # 按连续换行符拆分为段落，再用双换行重新拼接
+        paragraphs = re.split(r'\n+', text.strip())
+        paragraphs = [p.strip() for p in paragraphs if p.strip()]
+        return '\n\n'.join(paragraphs)
+    
+    def _normalize_case(self, text):
+        """将全大写的英文原文转为正常大小写以提升可读性"""
+        if not text:
+            return text
+        lines = text.split('\n')
+        result = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                result.append('')
+                continue
+            # 如果该行英文占比 > 60% 且大写字母占比 > 70%，则转换
+            alpha_chars = [c for c in stripped if c.isalpha()]
+            if alpha_chars:
+                upper_ratio = sum(1 for c in alpha_chars if c.isupper()) / len(alpha_chars)
+                if upper_ratio > 0.7:
+                    # 保留全部大写的短词（如拟声词）：长度 ≤ 5 且全大写则保留
+                    words = stripped.split()
+                    normalized_words = []
+                    for w in words:
+                        clean = w.strip(".,!?;:'\"")
+                        if len(clean) <= 5 and clean.isupper() and clean.isalpha():
+                            normalized_words.append(clean)  # 保留短大写词
+                        else:
+                            normalized_words.append(w.capitalize())
+                    line = ' '.join(normalized_words)
+            result.append(line)
+        return '\n'.join(result)
     
     def translate_image(self, image_path):
         """
@@ -350,6 +468,8 @@ class LLMEngine:
             )
             
             response_text = response.choices[0].message.content
+            if not response_text:
+                return "", "API Error: 模型返回了空内容，请重试或切换模型"
             
             # 解析返回结果
             origin_text, translated_text = self._parse_response(response_text, self.target_lang)

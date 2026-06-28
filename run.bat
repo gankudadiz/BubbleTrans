@@ -25,6 +25,6 @@ if %errorlevel% neq 0 (
     exit /b
 )
 
-REM Launch
-"%VENV_PYTHON%" src/main.py
-pause
+REM Launch GUI (pythonw suppresses console window)
+set VENV_PYTHONW=%~dp0.venv\Scripts\pythonw.exe
+start "" "%VENV_PYTHONW%" src/main.py

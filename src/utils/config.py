@@ -12,12 +12,16 @@ BubbleTrans - 配置文件管理模块
 
 配置文件格式（config.json）：
 {
-    "api_key": "your-api-key",
-    "base_url": "https://openrouter.ai/api/v1",
-    "model": "google/gemini-2.0-flash-001",
-     "use_vision": true,
-     "target_lang": "简体中文",
-     "successful_models": ["google/gemini-2.0-flash-001"]
+    "active_profile": "默认",
+    "profiles": {
+        "默认": {
+            "api_key": "your-api-key",
+            "base_url": "https://openrouter.ai/api/v1",
+            "model": "gemini-2.5-flash"
+        }
+    },
+    "target_lang": "简体中文",
+    "successful_models": ["gemini-2.5-flash"]
 }
 
 注意事项：

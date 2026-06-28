@@ -25,6 +25,7 @@ BubbleTrans - 设置对话框模块
 from PyQt6.QtWidgets import (
     QDialog,           # 对话框基类
     QVBoxLayout,       # 垂直布局
+    QHBoxLayout,       # 水平布局
     QFormLayout,       # 表单布局（标签-输入框对）
     QLineEdit,         # 单行文本输入框
     QDialogButtonBox,  # 按钮盒（确定/取消等）
@@ -32,6 +33,7 @@ from PyQt6.QtWidgets import (
     QLabel,            # 标签
     QMessageBox,       # 消息对话框
     QPushButton,       # 按钮
+    QInputDialog,      # 输入对话框（新建档案命名）
     QApplication,      # 应用程序对象
     QTextEdit,         # 多行文本编辑框
     QComboBox          # 下拉选择框
@@ -138,7 +140,7 @@ class SettingsDialog(QDialog):
         """
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.resize(520, 380)
+        self.resize(520, 420)
         self.init_ui()
     
     # ===================== 模型历史记录管理 =====================
@@ -222,8 +224,26 @@ class SettingsDialog(QDialog):
         # 主布局
         layout = QVBoxLayout(self)
         
-        # 表单布局（标签-输入框对）
+        # ===== 配置档案选择器 =====
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(QLabel("配置档案:"))
+        self.profile_combo = QComboBox()
+        self.profile_combo.currentTextChanged.connect(self._on_profile_changed)
+        profile_row.addWidget(self.profile_combo, 1)
+        
+        self.btn_new_profile = QPushButton("新建")
+        self.btn_new_profile.clicked.connect(self._new_profile)
+        profile_row.addWidget(self.btn_new_profile)
+        
+        self.btn_del_profile = QPushButton("删除")
+        self.btn_del_profile.clicked.connect(self._delete_profile)
+        profile_row.addWidget(self.btn_del_profile)
+        layout.addLayout(profile_row)
+        
+        # ===== 表单布局（标签-输入框对） =====
         form = QFormLayout()
+        
+        self._refresh_profile_list()  # 填充档案列表
         
         # ===== API密钥输入框 =====
         self.api_key_edit = QLineEdit(llm_engine.api_key)
@@ -292,6 +312,64 @@ class SettingsDialog(QDialog):
     
     # ===================== 功能方法 =====================
     
+    def _refresh_profile_list(self):
+        """刷新档案下拉列表"""
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        profiles = llm_engine.get_profiles()
+        for name in sorted(profiles.keys()):
+            self.profile_combo.addItem(name)
+        # 选中当前激活的档案
+        idx = self.profile_combo.findText(llm_engine.active_profile)
+        if idx >= 0:
+            self.profile_combo.setCurrentIndex(idx)
+        self.profile_combo.blockSignals(False)
+        # 至少保留一个档案，最后一个不可删除
+        self.btn_del_profile.setEnabled(len(profiles) > 1)
+    
+    def _on_profile_changed(self, name):
+        """切换档案时回填对应配置"""
+        if not name:
+            return
+        profiles = llm_engine.get_profiles()
+        profile = profiles.get(name, {})
+        self.api_key_edit.setText(profile.get("api_key", ""))
+        self.base_url_edit.setText(profile.get("base_url", ""))
+        self.model_combo.setCurrentText(profile.get("model", ""))
+    
+    def _new_profile(self):
+        """新建配置档案"""
+        name, ok = QInputDialog.getText(self, "新建档案", "档案名称:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        # 保存当前输入的配置为新档案
+        llm_engine.save_profile(
+            name,
+            self.api_key_edit.text().strip(),
+            self.base_url_edit.text().strip(),
+            self.model_combo.currentText().strip()
+        )
+        # 切换到新档案
+        llm_engine.switch_profile(name)
+        self._refresh_profile_list()
+    
+    def _delete_profile(self):
+        """删除当前档案"""
+        name = self.profile_combo.currentText()
+        if not name:
+            return
+        reply = QMessageBox.question(
+            self, "确认删除", f"确定要删除配置档案「{name}」吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        llm_engine.delete_profile(name)
+        self._refresh_profile_list()
+        # 重新加载当前档案
+        self._on_profile_changed(self.profile_combo.currentText())
+    
     def test_connection(self):
         """
         测试API连接
@@ -344,16 +422,6 @@ class SettingsDialog(QDialog):
         保存设置
         
         获取输入框中的值，配置LLM引擎并保存到配置文件
-        
-        保存内容：
-        - API密钥
-        - Base URL
-        - 模型名称
-        - Vision模式开关
-        
-        保存位置：
-        - 运行时配置：llm_engine对象
-        - 持久化：config.json文件
         """
         api_key = self.api_key_edit.text().strip()
         
@@ -362,24 +430,24 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "Warning", "API Key is empty!")
             return
         
+        profile_name = self.profile_combo.currentText().strip()
+        base_url = self.base_url_edit.text().strip()
+        model = self.model_combo.currentText().strip()
+        
         # 配置LLM引擎
-        llm_engine.configure(
-            api_key=api_key,
-            base_url=self.base_url_edit.text().strip(),
-            model=self.model_combo.currentText().strip()
-        )
-        
-        # 临时方案：将Vision设置存储在引擎实例上
-        llm_engine.use_vision = self.vision_check.isChecked()
+        llm_engine.configure(api_key=api_key, base_url=base_url, model=model)
         llm_engine.target_lang = self.lang_combo.currentText().strip()
+        llm_engine.use_vision = True
         
-        # 保存到配置文件
+        # 保存到当前档案
+        llm_engine.save_profile(profile_name, api_key, base_url, model)
+        # 如果切换了档案，同步激活
+        if profile_name != llm_engine.active_profile:
+            llm_engine.switch_profile(profile_name)
+        # 保存通用设置
         save_config({
-            "api_key": api_key,
-            "base_url": llm_engine.base_url,
-            "model": llm_engine.model,
+            "target_lang": llm_engine.target_lang,
             "use_vision": True,
-            "target_lang": llm_engine.target_lang
         })
         
         # 关闭对话框
