@@ -7,8 +7,8 @@ BubbleTrans - 图片画布模块
 
 核心功能：
 1. 图片显示 - 使用QGraphicsView展示漫画图片，支持缩放和平移
-2. 区域框选 - 鼠标左键拖动选择要翻译的区域
-3. 图片平移 - 鼠标右键拖动平移图片
+2. 图片平移 - 鼠标左键拖动平移图片
+3. 区域框选 - 鼠标右键拖动选择要翻译的区域
 4. 滚轮缩放 - 使用鼠标滚轮缩放图片
 
 技术实现：
@@ -18,8 +18,8 @@ BubbleTrans - 图片画布模块
 - 坐标映射: 视口坐标与场景坐标之间的转换
 
 鼠标操作：
-- 左键拖动：框选翻译区域
-- 右键拖动：平移图片
+- 左键拖动：平移图片
+- 右键拖动：框选翻译区域
 - 滚轮滚动：缩放图片
 """
 
@@ -80,8 +80,8 @@ class ImageCanvas(QGraphicsView):
     功能：
     - 显示加载的图片
     - 支持鼠标滚轮缩放
-    - 支持左键框选翻译区域
-    - 支持右键平移图片
+    - 支持右键框选翻译区域
+    - 支持左键平移图片
     - 窗口大小改变时自动调整或保持缩放
     
     信号：
@@ -427,26 +427,26 @@ class ImageCanvas(QGraphicsView):
         鼠标按下事件处理
         
         根据鼠标按钮启动不同的操作：
-        - 左键：开始框选
-        - 右键：开始平移
+        - 左键：开始平移
+        - 右键：开始框选
         
         参数:
             event: 鼠标事件对象
         """
         if event.button() == Qt.MouseButton.LeftButton:
-            # ===== 左键：开始框选 =====
+            # ===== 左键：开始平移 =====
+            self.is_panning = True
+            self.pan_start = event.pos()  # 记录起点
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)  # 切换光标为抓手
+            event.accept()
+            
+        elif event.button() == Qt.MouseButton.RightButton:
+            # ===== 右键：开始框选 =====
             self.is_selecting = True
             self.origin = event.pos()  # 记录起点位置
             # 设置橡皮筋的位置和大小
             self.rubber_band.setGeometry(QRect(self.origin, QSize()))
             self.rubber_band.show()    # 显示橡皮筋
-            event.accept()             # 标记事件已处理
-            
-        elif event.button() == Qt.MouseButton.RightButton:
-            # ===== 右键：开始平移 =====
-            self.is_panning = True
-            self.pan_start = event.pos()  # 记录起点
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)  # 切换光标为抓手
             event.accept()
             
         else:
@@ -493,14 +493,14 @@ class ImageCanvas(QGraphicsView):
         鼠标释放事件处理
         
         完成当前操作：
-        - 左键释放：完成框选，提取选区并发射信号
-        - 右键释放：结束平移
+        - 右键释放：完成框选，提取选区并发射信号
+        - 左键释放：结束平移
         
         参数:
             event: 鼠标事件对象
         """
-        if event.button() == Qt.MouseButton.LeftButton and self.is_selecting:
-            # ===== 左键释放：完成框选 =====
+        if event.button() == Qt.MouseButton.RightButton and self.is_selecting:
+            # ===== 右键释放：完成框选 =====
             self.is_selecting = False
             self.rubber_band.hide()  # 隐藏橡皮筋
             
@@ -529,8 +529,8 @@ class ImageCanvas(QGraphicsView):
             
             event.accept()
             
-        elif event.button() == Qt.MouseButton.RightButton and self.is_panning:
-            # ===== 右键释放：结束平移 =====
+        elif event.button() == Qt.MouseButton.LeftButton and self.is_panning:
+            # ===== 左键释放：结束平移 =====
             self.is_panning = False
             self.setCursor(Qt.CursorShape.ArrowCursor)  # 恢复光标形状
             event.accept()
