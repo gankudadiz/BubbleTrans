@@ -58,7 +58,7 @@ from utils.config import load_config
 # 1. 导入模块：from engine.llm import llm_engine
 # 2. 配置API密钥：llm_engine.configure(api_key, base_url, model)
 # 3. 设置目标语言：llm_engine.target_lang = "简体中文"
-# 4. 调用翻译：origin_text, translated_text = llm_engine.translate_image(image_path)
+# 4. 调用翻译：origin_text, translated_text, summary_dict = llm_engine.translate_image(image_path)
 #
 # 设计模式：
 # - 单例模式：全局只有一个llm_engine实例
@@ -317,6 +317,8 @@ class LLMEngine:
 - 善用语气词：适当使用吧、啊、呢、嘛、哦、嗯等，但不要滥用卖萌
 - 节奏感：战斗/争吵用短句快节奏，叙述/独白可稍长但不啰嗦
 - 专名一致：同一角色名、地名、组织名的译法全文统一
+- 剧情总结要求：2-4句话概括本页关键事件，提到角色、场景、推进点，纯叙述不评价
+- 翻译备注要求：列出专名译法、双关语、文化梗等特殊处理，无则写"本页无特殊翻译处理"
 
 输出格式严格要求如下（不要添加任何额外说明）：
 
@@ -337,22 +339,32 @@ class LLMEngine:
 - 原文和译文段落数量必须一一对应
 - 原文中的英文如全是大写（美漫常见格式），请在<原文>中转为正常大小写格式以便中文读者阅读（如"I'M GOING"→"I'm going"）。拟声词保留原样
 - 专有名词（人名、地名、组织等）：翻译为中文，并在其后用括号标注原文。不确定译名时保留原文
-- 不确定的内容保留原文并标注[?]"""
+- 不确定的内容保留原文并标注[?]
+
+<总结>
+<剧情>
+2-4句话概括本页发生的关键事件。提到出场角色、场景变化、剧情推进点。纯叙述，不评价。
+</剧情>
+<备注>
+列出本页翻译中的特殊处理（专名译法、双关语、文化梗解释）。没有特殊情况时写"本页无特殊翻译处理"。每条一行，简洁。
+</备注>
+</总结>"""
     
     def _parse_response(self, response_text, target_lang):
         """
         解析LLM返回的结果
         
-        从带XML标签的响应中提取原文和译文
+        从带XML标签的响应中提取原文、译文和总结
         
         参数:
             response_text: LLM返回的原始文本
             target_lang: 目标语言
             
         返回:
-            (origin_text, translated_text) 元组
+            (origin_text, translated_text, summary_dict) 三元组
             - origin_text: 识别到的原文文本（段落间 \n\n 分隔）
             - translated_text: 翻译后的译文文本（段落间 \n\n 分隔）
+            - summary_dict: 包含"plot"（剧情总结）和"notes"（翻译备注）的字典
         """
         lang_tag = self._get_language_tag(target_lang)
         
@@ -370,7 +382,22 @@ class LLMEngine:
         translated_text = self._normalize_paragraphs(translated_text)
         origin_text = self._normalize_case(origin_text)
         
-        return origin_text, translated_text
+        # 提取总结
+        plot_text = ""
+        notes_text = ""
+        summary_match = re.search(r'<总结>\s*(.*?)</总结>', response_text, re.DOTALL)
+        if summary_match:
+            summary_content = summary_match.group(1)
+            plot_match = re.search(r'<剧情>\s*(.*?)</剧情>', summary_content, re.DOTALL)
+            if plot_match:
+                plot_text = plot_match.group(1).strip()
+            notes_match = re.search(r'<备注>\s*(.*?)</备注>', summary_content, re.DOTALL)
+            if notes_match:
+                notes_text = notes_match.group(1).strip()
+        
+        summary_dict = {"plot": plot_text, "notes": notes_text}
+        
+        return origin_text, translated_text, summary_dict
     
     def _normalize_paragraphs(self, text):
         """确保段落间用空行分隔（兼容模型不遵循指令的情况）"""
@@ -421,19 +448,20 @@ class LLMEngine:
             image_path: 图片文件路径
             
         返回:
-            (origin_text, translated_text) 元组
+            (origin_text, translated_text, summary_dict) 三元组
             - origin_text: 识别的原文文本（段落间 \n\n 分隔）
             - translated_text: 译文文本（段落间 \n\n 分隔）
+            - summary_dict: 包含"plot"（剧情总结）和"notes"（翻译备注）的字典
             
-        失败时返回 ("", 错误信息)
+        失败时返回 ("", 错误信息, {"plot": "", "notes": ""})
         """
         # 检查客户端是否已配置
         if not self.client:
-            return "", "Error: API not configured. Please go to Settings."
+            return "", "Error: API not configured. Please go to Settings.", {"plot": "", "notes": ""}
         
         # 检查图片文件是否存在
         if not os.path.exists(image_path):
-            return "", f"Error: Image file not found: {image_path}"
+            return "", f"Error: Image file not found: {image_path}", {"plot": "", "notes": ""}
         
         # ===== 构建系统提示词 =====
         system_prompt = self._build_system_prompt(self.target_lang)
@@ -441,7 +469,7 @@ class LLMEngine:
         # ===== 编码图片 =====
         base64_image = self.encode_image(image_path)
         if not base64_image:
-            return "", f"Error: Failed to encode image: {image_path}"
+            return "", f"Error: Failed to encode image: {image_path}", {"plot": "", "notes": ""}
         
         # ===== 构建消息列表 =====
         messages = [
@@ -469,15 +497,15 @@ class LLMEngine:
             
             response_text = response.choices[0].message.content
             if not response_text:
-                return "", "API Error: 模型返回了空内容，请重试或切换模型"
+                return "", "API Error: 模型返回了空内容，请重试或切换模型", {"plot": "", "notes": ""}
             
             # 解析返回结果
-            origin_text, translated_text = self._parse_response(response_text, self.target_lang)
+            origin_text, translated_text, summary_dict = self._parse_response(response_text, self.target_lang)
             
-            return origin_text, translated_text
+            return origin_text, translated_text, summary_dict
             
         except Exception as e:
-            return "", f"API Error: {str(e)}"
+            return "", f"API Error: {str(e)}", {"plot": "", "notes": ""}
     
     def test_connection(self, api_key, base_url, model):
         """

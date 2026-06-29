@@ -91,16 +91,16 @@ from engine.llm import llm_engine
 # - 使用QThread可以在后台执行这些任务，不阻塞UI响应
 #
 # 信号说明：
-# - finished: 任务完成时发射，携带原文和译文（str, str）
+# - finished: 任务完成时发射，携带原文、译文和总结字典（str, str, dict）
 # - error:    发生错误时发射，携带错误信息
 # - status:   状态更新时发射，用于显示当前进度
 # ============================================================================
 class TranslationWorker(QThread):
     # 定义信号，pyqtSignal用于跨线程通信
     # (str, str) 表示信号携带两个字符串参数
-    finished = pyqtSignal(str, str)  # origin_text, translated_text
-    error = pyqtSignal(str)          # 错误信息
-    status = pyqtSignal(str)         # 状态信息
+    finished = pyqtSignal(str, str, dict)  # origin_text, translated_text, summary_dict
+    error = pyqtSignal(str)                # 错误信息
+    status = pyqtSignal(str)               # 状态信息
     
     def __init__(self, image_path):
         """
@@ -120,8 +120,8 @@ class TranslationWorker(QThread):
         """
         try:
             self.status.emit("翻译中…")
-            origin_text, translated_text = llm_engine.translate_image(self.image_path)
-            self.finished.emit(origin_text, translated_text)
+            origin_text, translated_text, summary_dict = llm_engine.translate_image(self.image_path)
+            self.finished.emit(origin_text, translated_text, summary_dict)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -254,6 +254,11 @@ class MainWindow(QMainWindow):
         self.worker = None            # 翻译工作线程实例
         self._temp_files = []         # 待清理的临时文件路径列表
         
+        # 右侧面板状态
+        self.origin_text = ""         # 当前原文
+        self.translated_text = ""     # 当前译文
+        self.current_tab = "trans"    # 当前选中的 tab（默认译文）
+        
         # === 图片缓存与异步加载 ===
         # LRU缓存：最多缓存10张已解码的 QPixmap，翻回同一页秒开
         self.pixmap_cache = OrderedDict()   # path -> QPixmap
@@ -315,7 +320,7 @@ class MainWindow(QMainWindow):
         right_panel.setFixedWidth(300)
         right_layout = QVBoxLayout(right_panel)
         
-        # --- 工具栏行 ---
+        # --- 按钮行（保持不变）---
         tool_row = QHBoxLayout()
         self.translate_page_btn = QPushButton("翻译当前页")
         self.translate_page_btn.clicked.connect(self.translate_current_page)
@@ -326,25 +331,87 @@ class MainWindow(QMainWindow):
         tool_row.addWidget(self.lang_label)
         right_layout.addLayout(tool_row)
         
-        # --- 原文区域 ---
-        right_layout.addWidget(QLabel("▼ 原文"))
-        self.origin_text_edit = QTextEdit()
-        self.origin_text_edit.setReadOnly(True)
-        self.origin_text_edit.setPlaceholderText("原文将显示在此…")
-        right_layout.addWidget(self.origin_text_edit)
+        # --- 分段切换按钮："原文" / "译文" ---
+        seg_container = QWidget()
+        seg_container.setObjectName("segContainer")
+        seg_container.setStyleSheet("""
+            QWidget#segContainer {
+                background-color: #1e1e1e;
+                border: 1px solid #444;
+                border-radius: 4px;
+                padding: 2px;
+            }
+        """)
+        seg_layout = QHBoxLayout(seg_container)
+        seg_layout.setContentsMargins(0, 0, 0, 0)
+        seg_layout.setSpacing(0)
         
-        # --- 译文区域 ---
-        self.trans_label = QLabel(f"▼ 译文（{llm_engine.target_lang}）")
-        right_layout.addWidget(self.trans_label)
-        self.trans_text_edit = QTextEdit()
-        self.trans_text_edit.setReadOnly(True)
-        self.trans_text_edit.setPlaceholderText("译文将显示在此…")
-        right_layout.addWidget(self.trans_text_edit)
+        self.btn_origin_seg = QPushButton("原文")
+        self.btn_trans_seg = QPushButton("译文")
+        self.btn_origin_seg.setCheckable(True)
+        self.btn_trans_seg.setCheckable(True)
+        
+        # 分段按钮样式（选中 / 未选中 / hover）
+        seg_btn_style = """
+            QPushButton {
+                background-color: transparent;
+                color: #999999;
+                border: 1px solid transparent;
+                border-radius: 4px;
+                padding: 6px 16px;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #2b2b2b;
+            }
+            QPushButton:checked {
+                background-color: #3a3a3a;
+                color: #ffffff;
+                border: 1px solid #555;
+            }
+        """
+        self.btn_origin_seg.setStyleSheet(seg_btn_style)
+        self.btn_trans_seg.setStyleSheet(seg_btn_style)
+        
+        self.btn_origin_seg.clicked.connect(lambda: self._switch_tab("origin"))
+        self.btn_trans_seg.clicked.connect(lambda: self._switch_tab("trans"))
+        
+        seg_layout.addWidget(self.btn_origin_seg)
+        seg_layout.addWidget(self.btn_trans_seg)
+        right_layout.addWidget(seg_container)
+        
+        # --- QSplitter（垂直方向，分割共享文本区和总结区）---
+        self.right_splitter = QSplitter(Qt.Orientation.Vertical)
+        
+        # --- 共享文本区 ---
+        self.shared_text_edit = QTextEdit()
+        self.shared_text_edit.setReadOnly(True)
+        self.shared_text_edit.setPlaceholderText("请先点击「翻译当前页」或框选区域进行翻译")
+        self.right_splitter.addWidget(self.shared_text_edit)
+        
+        # --- 总结区 ---
+        summary_widget = QWidget()
+        summary_layout = QVBoxLayout(summary_widget)
+        summary_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.summary_label = QLabel("▼ 当页总结")
+        summary_layout.addWidget(self.summary_label)
+        self.summary_text_edit = QTextEdit()
+        self.summary_text_edit.setReadOnly(True)
+        self.summary_text_edit.setPlaceholderText("翻译后将自动生成当页剧情总结和翻译备注")
+        summary_layout.addWidget(self.summary_text_edit)
+        
+        self.right_splitter.addWidget(summary_widget)
+        
+        right_layout.addWidget(self.right_splitter)
         
         splitter.addWidget(right_panel)
         
         # 设置分割器初始比例：[200, 600, 300]
         splitter.setSizes([200, 600, 300])
+        
+        # 默认选中"译文" tab
+        self._switch_tab("trans")
         
         # ===== 状态栏 =====
         self.status_bar = QStatusBar()
@@ -563,6 +630,23 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self)
         dlg.exec()  # exec()以模态方式显示对话框
     
+    # ===================== 分段切换 =====================
+    
+    def _switch_tab(self, tab):
+        """
+        切换原文/译文 tab
+        
+        参数:
+            tab: "origin" 或 "trans"
+        """
+        self.current_tab = tab
+        self.btn_origin_seg.setChecked(tab == "origin")
+        self.btn_trans_seg.setChecked(tab == "trans")
+        text = self.origin_text if tab == "origin" else self.translated_text
+        self.shared_text_edit.setText(text if text else "")
+    
+    # ===================== 翻译回调 =====================
+    
     def handle_region_selected(self, pixmap: QPixmap):
         """
         处理框选区域完成事件
@@ -584,11 +668,9 @@ class MainWindow(QMainWindow):
         # 用户确认后，开始处理
         self._set_translating(True)
         self.status_bar.showMessage("翻译中...")
-        # 临时更新面板标签
-        self.origin_text_edit.setPlaceholderText("▼ 框选原文")
-        self.trans_text_edit.setPlaceholderText("▼ 框选译文")
-        self.origin_text_edit.clear()
-        self.trans_text_edit.clear()
+        self.origin_text = ""
+        self.translated_text = ""
+        self.shared_text_edit.clear()
         
         # 保存临时文件（使用唯一文件名，避免并发冲突）
         try:
@@ -610,18 +692,42 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"保存临时图片失败: {e}")
     
-    def on_translation_finished(self, origin_text, translated_text):
+    def on_translation_finished(self, origin_text, translated_text, summary_dict):
         """
-        翻译完成回调函数 - v2.0：直接显示原文段落和译文段落
+        翻译完成回调函数
         
         当TranslationWorker完成翻译后，此方法被调用
         
         参数:
             origin_text:     原文文本
             translated_text: 译文文本
+            summary_dict:    总结数据字典 {"plot": "剧情摘要", "notes": "翻译备注"}
         """
-        self.origin_text_edit.setText(origin_text)
-        self.trans_text_edit.setText(translated_text)
+        self.origin_text = origin_text
+        self.translated_text = translated_text
+        
+        # 自动切换到译文 tab
+        self._switch_tab("trans")
+        
+        # 填充总结区
+        if summary_dict and (summary_dict.get("plot") or summary_dict.get("notes")):
+            plot = summary_dict.get("plot", "").strip()
+            notes = summary_dict.get("notes", "").strip()
+            html_parts = []
+            if plot:
+                html_parts.append("📖 剧情")
+                html_parts.append("<br><br>")
+                html_parts.append(plot)
+            if notes:
+                if plot:
+                    html_parts.append("<br><br>")
+                html_parts.append("📝 翻译备注")
+                html_parts.append("<br><br>")
+                html_parts.append(notes)
+            self.summary_text_edit.setHtml("".join(html_parts))
+        else:
+            self.summary_text_edit.setPlainText("本页暂未生成总结")
+        
         self._set_translating(False)
         self.status_bar.showMessage("翻译完成", 5000)
     
@@ -663,9 +769,10 @@ class MainWindow(QMainWindow):
         image_path = self.canvas._current_image_path
         self._set_translating(True)
         self.status_bar.showMessage("翻译中…")
-        self.origin_text_edit.clear()
-        self.trans_text_edit.clear()
-        self.origin_text_edit.setText("翻译中…")
+        self.origin_text = ""
+        self.translated_text = ""
+        self.shared_text_edit.clear()
+        self.shared_text_edit.setText("翻译中…")
         
         self.worker = TranslationWorker(image_path)
         self.worker.status.connect(self.status_bar.showMessage)
