@@ -60,7 +60,12 @@ from PyQt6.QtCore import (
 # ============================================================================
 import os               # 文件路径操作
 import tempfile         # 临时文件目录
+import uuid             # 唯一标识，用于生成不重复的临时文件名
+import time             # 耗时统计
+import logging          # 日志记录
 from collections import OrderedDict  # LRU缓存
+
+_logger = logging.getLogger("BubbleTrans")
 
 # ============================================================================
 # 项目内部模块导入
@@ -247,6 +252,7 @@ class MainWindow(QMainWindow):
         # 实例变量初始化
         self.current_folder = ""      # 当前打开的文件夹路径
         self.worker = None            # 翻译工作线程实例
+        self._temp_files = []         # 待清理的临时文件路径列表
         
         # === 图片缓存与异步加载 ===
         # LRU缓存：最多缓存10张已解码的 QPixmap，翻回同一页秒开
@@ -353,11 +359,17 @@ class MainWindow(QMainWindow):
         
         弹出文件夹选择对话框，选择后加载文件夹中的图片文件
         """
+        _logger.info("open_folder: 弹出目录选择对话框")
         folder = QFileDialog.getExistingDirectory(self, "Select Comic Folder")
         if folder:
+            t0 = time.time()
+            _logger.info(f"open_folder: 已选择目录 {folder}")
             self.current_folder = folder
             self._clear_image_cache()   # 切换文件夹时清空旧缓存
+            _logger.info(f"open_folder: _clear_image_cache 耗时 {time.time()-t0:.3f}s")
+            t1 = time.time()
             self.load_file_list()
+            _logger.info(f"open_folder: load_file_list 耗时 {time.time()-t1:.3f}s")
             self.status_bar.showMessage(f"Loaded folder: {folder}")
     
     def load_file_list(self):
@@ -372,13 +384,18 @@ class MainWindow(QMainWindow):
         
         try:
             # 获取文件夹中所有符合条件的文件
+            t0 = time.time()
             files = sorted([
                 f for f in os.listdir(self.current_folder)
                 if os.path.splitext(f)[1].lower() in valid_exts
             ])
+            _logger.info(f"load_file_list: os.listdir + sorted 扫描 {len(files)} 个文件，耗时 {time.time()-t0:.3f}s")
             # 添加到列表控件
+            t1 = time.time()
             self.file_list.addItems(files)
+            _logger.info(f"load_file_list: addItems 耗时 {time.time()-t1:.3f}s")
         except Exception as e:
+            _logger.error(f"load_file_list 失败: {e}")
             QMessageBox.critical(self, "Error", f"Failed to load folder: {e}")
     
     def load_image(self, item):
@@ -493,6 +510,8 @@ class MainWindow(QMainWindow):
         for path, worker in list(self.pending_loads.items()):
             if worker.isRunning():
                 worker.terminate()
+                worker.wait(500)        # 等待线程结束（最多0.5秒，避免阻塞UI）
+                worker.deleteLater()    # 安全释放 Qt 资源
         self.pending_loads.clear()
         self.current_file_index = -1
         # 隐藏导航按钮和页码指示器
@@ -571,11 +590,14 @@ class MainWindow(QMainWindow):
         self.origin_text_edit.clear()
         self.trans_text_edit.clear()
         
-        # 保存临时文件（使用持久临时文件，线程可以读取）
+        # 保存临时文件（使用唯一文件名，避免并发冲突）
         try:
             temp_dir = tempfile.gettempdir()
-            temp_path = os.path.join(temp_dir, "pact_crop.png")
+            # 用 uuid 生成唯一文件名，避免多次框选时的并发覆盖问题
+            unique_name = f"bubbletrans_{uuid.uuid4().hex[:8]}.png"
+            temp_path = os.path.join(temp_dir, unique_name)
             pixmap.save(temp_path, "PNG")
+            self._temp_files.append(temp_path)  # 记录待清理的临时文件
             
             # 启动翻译工作线程
             self.worker = TranslationWorker(temp_path)
@@ -623,10 +645,14 @@ class MainWindow(QMainWindow):
             self.translate_page_btn.setText("翻译中…")
         else:
             self.translate_page_btn.setText("翻译当前页")
-            # 如果有进行中的 worker，终止它
+            # 如果有进行中的 worker，安全终止它
             if self.worker and self.worker.isRunning():
                 self.worker.terminate()
+                self.worker.wait(500)        # 等待线程结束（最多0.5秒）
+                self.worker.deleteLater()    # 安全释放 Qt 资源
                 self.worker = None
+            # 清理残留的临时文件
+            self._clean_temp_files()
     
     def translate_current_page(self):
         """翻译当前画布中显示的整张图片"""
@@ -655,3 +681,34 @@ class MainWindow(QMainWindow):
             self._nav_next_page()
         else:
             super().keyPressEvent(event)
+    
+    # ===================== 资源清理 =====================
+    
+    def _clean_temp_files(self):
+        """清理所有记录的临时文件"""
+        for f in self._temp_files:
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except OSError:
+                pass  # 文件被占用或已删除，忽略
+        self._temp_files.clear()
+    
+    def closeEvent(self, event):
+        """窗口关闭时优雅停止所有后台线程并清理临时文件"""
+        # 终止翻译 worker
+        if self.worker and self.worker.isRunning():
+            self.worker.terminate()
+            self.worker.wait(3000)
+            self.worker.deleteLater()
+            self.worker = None
+        # 终止所有图片加载 worker
+        for path, worker in list(self.pending_loads.items()):
+            if worker.isRunning():
+                worker.terminate()
+                worker.wait(3000)
+                worker.deleteLater()
+        self.pending_loads.clear()
+        # 清理临时文件
+        self._clean_temp_files()
+        event.accept()
