@@ -59,6 +59,7 @@ from PyQt6.QtCore import (
 # 标准库导入
 # ============================================================================
 import os               # 文件路径操作
+import re               # 正则表达式
 import tempfile         # 临时文件目录
 import uuid             # 唯一标识，用于生成不重复的临时文件名
 import time             # 耗时统计
@@ -717,13 +718,17 @@ class MainWindow(QMainWindow):
             if plot:
                 html_parts.append("📖 剧情")
                 html_parts.append("<br><br>")
-                html_parts.append(plot)
+                html_parts.append(plot.replace('\n', '<br>'))
             if notes:
                 if plot:
                     html_parts.append("<br><br>")
                 html_parts.append("📝 翻译备注")
                 html_parts.append("<br><br>")
-                html_parts.append(notes)
+                # 正则处理换行：LLM 返回的 \n 在 HTML 中被忽略，统一转为 <br>
+                # 同时处理 " - " 模式，确保列表项各自独占一行
+                notes_html = notes.replace('\n', '<br>')
+                notes_html = re.sub(r'\s+-\s+', '<br>- ', notes_html)
+                html_parts.append(notes_html)
             self.summary_text_edit.setHtml("".join(html_parts))
         else:
             self.summary_text_edit.setPlainText("本页暂未生成总结")
