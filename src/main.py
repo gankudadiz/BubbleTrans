@@ -159,7 +159,7 @@ def main():
     
     # 显示窗口
     # 默认情况下窗口是隐藏的，需要调用show()方法显示
-    window.show()
+    window.showMaximized()
     
     # 启动应用程序的事件循环
     # exec() 方法开始处理事件，会阻塞程序直到用户关闭窗口
