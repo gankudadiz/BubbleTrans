@@ -636,7 +636,7 @@ class MainWindow(QMainWindow):
     def _switch_tab(self, tab):
         """
         切换原文/译文 tab
-        
+
         参数:
             tab: "origin" 或 "trans"
         """
@@ -696,9 +696,9 @@ class MainWindow(QMainWindow):
     def on_translation_finished(self, origin_text, translated_text, summary_dict):
         """
         翻译完成回调函数
-        
+
         当TranslationWorker完成翻译后，此方法被调用
-        
+
         参数:
             origin_text:     原文文本
             translated_text: 译文文本
@@ -706,7 +706,7 @@ class MainWindow(QMainWindow):
         """
         self.origin_text = origin_text
         self.translated_text = translated_text
-        
+
         # 自动切换到译文 tab
         self._switch_tab("trans")
         

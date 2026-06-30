@@ -498,10 +498,10 @@ class LLMEngine:
             response_text = response.choices[0].message.content
             if not response_text:
                 return "", "API Error: 模型返回了空内容，请重试或切换模型", {"plot": "", "notes": ""}
-            
+
             # 解析返回结果
             origin_text, translated_text, summary_dict = self._parse_response(response_text, self.target_lang)
-            
+
             return origin_text, translated_text, summary_dict
             
         except Exception as e:
