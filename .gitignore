@@ -1,4 +1,5 @@
 config.json
+translation_cache.json
 
 .venv/
 venv/

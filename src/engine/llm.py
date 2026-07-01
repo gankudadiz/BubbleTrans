@@ -50,6 +50,14 @@ from utils.config import load_config
 
 
 # ============================================================================
+# TranslationError — 翻译异常（非崩溃性错误，用于 UI 弹窗提示）
+# ============================================================================
+class TranslationError(Exception):
+    """翻译过程中发生的可恢复错误，如 API 限流、网络故障、密钥无效等"""
+    pass
+
+
+# ============================================================================
 # LLMEngine 类 - 大语言模型引擎
 # ============================================================================
 # 封装与LLM API的所有交互逻辑
@@ -101,6 +109,10 @@ class LLMEngine:
         self.client = None                                      # OpenAI客户端实例
         self.active_profile = "默认"                            # 当前激活的配置档案
         
+        # 翻译缓存（由 MainWindow 注入，类型: Optional[TranslationCache]）
+        self.cache = None  # type: ignore
+        self.last_from_cache = False
+
         # 从配置文件加载设置
         self._load_from_config()
     
@@ -440,36 +452,48 @@ class LLMEngine:
     def translate_image(self, image_path):
         """
         翻译图片中的文字
-        
+
         直接将图片发送给多模态LLM，同时完成文字识别和翻译。
         这是v2.0的核心翻译方法，替代了旧的translate方法。
-        
+
         参数:
             image_path: 图片文件路径
-            
+
         返回:
             (origin_text, translated_text, summary_dict) 三元组
             - origin_text: 识别的原文文本（段落间 \n\n 分隔）
             - translated_text: 译文文本（段落间 \n\n 分隔）
             - summary_dict: 包含"plot"（剧情总结）和"notes"（翻译备注）的字典
-            
-        失败时返回 ("", 错误信息, {"plot": "", "notes": ""})
+
+        异常:
+            TranslationError: API 未配置、文件不存在、编码失败、API 调用失败等
+                              调用后可通过 self.last_from_cache 判断结果是否来自缓存。
         """
+        self.last_from_cache = False
+
         # 检查客户端是否已配置
         if not self.client:
-            return "", "Error: API not configured. Please go to Settings.", {"plot": "", "notes": ""}
-        
+            raise TranslationError("API 未配置，请前往设置页面配置 API 密钥")
+
         # 检查图片文件是否存在
         if not os.path.exists(image_path):
-            return "", f"Error: Image file not found: {image_path}", {"plot": "", "notes": ""}
-        
+            raise TranslationError(f"图片文件不存在: {image_path}")
+
+        # ===== 查询翻译缓存 =====
+        if self.cache:
+            mtime = os.path.getmtime(image_path)
+            cached = self.cache.get(image_path, mtime)
+            if cached:
+                self.last_from_cache = True
+                return cached["original"], cached["translated"], cached["summary"]
+
         # ===== 构建系统提示词 =====
         system_prompt = self._build_system_prompt(self.target_lang)
-        
+
         # ===== 编码图片 =====
         base64_image = self.encode_image(image_path)
         if not base64_image:
-            return "", f"Error: Failed to encode image: {image_path}", {"plot": "", "notes": ""}
+            raise TranslationError(f"图片编码失败: {image_path}")
         
         # ===== 构建消息列表 =====
         messages = [
@@ -497,15 +521,42 @@ class LLMEngine:
             
             response_text = response.choices[0].message.content
             if not response_text:
-                return "", "API Error: 模型返回了空内容，请重试或切换模型", {"plot": "", "notes": ""}
+                # 模型返回空内容 → 尝试缓存降级
+                fallback = self._try_cache_fallback(image_path)
+                if fallback:
+                    return fallback
+                raise TranslationError("模型返回了空内容，请重试或切换模型")
 
             # 解析返回结果
             origin_text, translated_text, summary_dict = self._parse_response(response_text, self.target_lang)
 
             return origin_text, translated_text, summary_dict
             
+        except TranslationError:
+            # TranslationError 直接向上传递，不在此捕获
+            raise
         except Exception as e:
-            return "", f"API Error: {str(e)}", {"plot": "", "notes": ""}
+            # API 调用异常 → 尝试缓存降级
+            fallback = self._try_cache_fallback(image_path)
+            if fallback:
+                return fallback
+            raise TranslationError(f"API 调用失败: {e}")
+    
+    def _try_cache_fallback(self, image_path):
+        """
+        尝试从缓存中降级获取同一图片的历史翻译（忽略 mtime）
+
+        返回:
+            命中时返回 (origin, translated, summary) 三元组
+            未命中返回 None
+        """
+        if not self.cache:
+            return None
+        cached = self.cache.get_fallback(image_path)
+        if cached:
+            self.last_from_cache = True
+            return cached["original"], cached["translated"], cached["summary"]
+        return None
     
     def test_connection(self, api_key, base_url, model):
         """

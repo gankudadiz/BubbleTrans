@@ -79,6 +79,7 @@ _logger = logging.getLogger("BubbleTrans")
 from ui.canvas import ImageCanvas
 from ui.settings import SettingsDialog
 from engine.llm import llm_engine
+from utils.cache import TranslationCache
 
 
 # ============================================================================
@@ -259,6 +260,7 @@ class MainWindow(QMainWindow):
         self.origin_text = ""         # 当前原文
         self.translated_text = ""     # 当前译文
         self.current_tab = "trans"    # 当前选中的 tab（默认译文）
+        self._translating_image_path = ""  # 正在翻译的图片路径（用于缓存判断）
         
         # === 图片缓存与异步加载 ===
         # LRU缓存：最多缓存10张已解码的 QPixmap，翻回同一页秒开
@@ -267,6 +269,10 @@ class MainWindow(QMainWindow):
         self.current_file_index = -1        # 当前显示的文件在列表中的索引
         self.MAX_CACHE_SIZE = 10            # 最大缓存页数
         self.PREFETCH_RANGE = 2             # 相邻预加载范围（前后各2页）
+        
+        # 初始化翻译缓存（注入到全局 llm_engine 实例）
+        self.translation_cache = TranslationCache()
+        llm_engine.cache = self.translation_cache
         
         # 初始化UI
         self.init_ui()
@@ -679,6 +685,7 @@ class MainWindow(QMainWindow):
             # 用 uuid 生成唯一文件名，避免多次框选时的并发覆盖问题
             unique_name = f"bubbletrans_{uuid.uuid4().hex[:8]}.png"
             temp_path = os.path.join(temp_dir, unique_name)
+            self._translating_image_path = temp_path  # 临时文件路径（缓存时会过滤）
             pixmap.save(temp_path, "PNG")
             self._temp_files.append(temp_path)  # 记录待清理的临时文件
             
@@ -706,6 +713,22 @@ class MainWindow(QMainWindow):
         """
         self.origin_text = origin_text
         self.translated_text = translated_text
+
+        # 仅缓存完整页面翻译结果（非临时文件的框选翻译）
+        if not llm_engine.last_from_cache and self._translating_image_path:
+            current_path = self._translating_image_path
+            if current_path and os.path.exists(current_path):
+                # 框选翻译使用临时文件，不应缓存
+                is_temp = tempfile.gettempdir() in current_path
+                if not is_temp:
+                    mtime = os.path.getmtime(current_path)
+                    self.translation_cache.set(current_path, mtime, {
+                        "original": origin_text,
+                        "translated": translated_text,
+                        "summary": summary_dict,
+                    })
+                    self.translation_cache.save()
+            self._translating_image_path = ""
 
         # 自动切换到译文 tab
         self._switch_tab("trans")
@@ -772,6 +795,7 @@ class MainWindow(QMainWindow):
             return
         
         image_path = self.canvas._current_image_path
+        self._translating_image_path = image_path  # 记录路径用于缓存写回
         self._set_translating(True)
         self.status_bar.showMessage("翻译中…")
         self.origin_text = ""
