@@ -60,7 +60,9 @@ from PyQt6.QtCore import (
 # ============================================================================
 import os               # 文件路径操作
 import re               # 正则表达式
+import shutil           # 文件操作（删除目录树）
 import tempfile         # 临时文件目录
+import zipfile          # ZIP 格式校验
 import uuid             # 唯一标识，用于生成不重复的临时文件名
 import time             # 耗时统计
 import logging          # 日志记录
@@ -80,6 +82,7 @@ from ui.canvas import ImageCanvas
 from ui.settings import SettingsDialog
 from engine.llm import llm_engine
 from utils.cache import TranslationCache
+import utils.archive as archive  # 压缩包支持
 
 
 # ============================================================================
@@ -255,6 +258,7 @@ class MainWindow(QMainWindow):
         self.current_folder = ""      # 当前打开的文件夹路径
         self.worker = None            # 翻译工作线程实例
         self._temp_files = []         # 待清理的临时文件路径列表
+        self._archive_temp_dir = ""   # 压缩包解压的临时目录（非空表示当前来源是压缩包）
         
         # 右侧面板状态
         self.origin_text = ""         # 当前原文
@@ -294,7 +298,12 @@ class MainWindow(QMainWindow):
         open_action = QAction("Open Folder", self)
         open_action.triggered.connect(self.open_folder)  # 点击时调用open_folder方法
         toolbar.addAction(open_action)
-        
+
+        # "打开压缩包"按钮（新增：支持 .cbz / .zip 漫画压缩包）
+        open_archive_action = QAction("Open Archive", self)
+        open_archive_action.triggered.connect(self.open_archive)
+        toolbar.addAction(open_archive_action)
+
         # "设置"按钮
         settings_action = QAction("Settings", self)
         settings_action.triggered.connect(self.open_settings)
@@ -430,21 +439,76 @@ class MainWindow(QMainWindow):
     def open_folder(self):
         """
         打开文件夹对话框
-        
+
         弹出文件夹选择对话框，选择后加载文件夹中的图片文件
         """
         _logger.info("open_folder: 弹出目录选择对话框")
         folder = QFileDialog.getExistingDirectory(self, "Select Comic Folder")
         if folder:
-            t0 = time.time()
-            _logger.info(f"open_folder: 已选择目录 {folder}")
-            self.current_folder = folder
-            self._clear_image_cache()   # 切换文件夹时清空旧缓存
-            _logger.info(f"open_folder: _clear_image_cache 耗时 {time.time()-t0:.3f}s")
-            t1 = time.time()
-            self.load_file_list()
-            _logger.info(f"open_folder: load_file_list 耗时 {time.time()-t1:.3f}s")
-            self.status_bar.showMessage(f"Loaded folder: {folder}")
+            self._load_source(folder, is_archive=False)
+
+    def open_archive(self):
+        """
+        打开漫画压缩包对话框
+
+        弹出文件选择对话框，选择 .cbz/.zip 压缩包后解压到临时目录并加载
+        """
+        _logger.info("open_archive: 弹出压缩包选择对话框")
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Comic Archive",
+            "",
+            "Comic Archive (*.cbz *.zip)"
+        )
+        if file_path:
+            self._load_source(file_path, is_archive=True)
+
+    def _load_source(self, path: str, is_archive: bool):
+        """
+        统一加载入口：文件夹或压缩包分发
+
+        参数:
+            path: 文件夹路径或压缩包文件路径
+            is_archive: True 表示压缩包，False 表示文件夹
+        """
+        # 清理上一次的压缩包临时目录（如有）
+        self._cleanup_archive_temp()
+
+        if is_archive:
+            archive_name = os.path.basename(path)
+            _logger.info(f"_load_source: 解压压缩包 {archive_name}")
+            try:
+                temp_dir, image_files = archive.extract_to_temp(path)
+                self._archive_temp_dir = temp_dir
+                self.current_folder = temp_dir
+            except (ValueError, zipfile.BadZipFile, OSError) as e:
+                _logger.error(f"_load_source: 解压失败 {archive_name}: {e}")
+                QMessageBox.critical(self, "解压失败", str(e))
+                return
+            except Exception as e:
+                # 兜底：捕获 CRC 校验失败(binascii.Error)等未预料的异常
+                _logger.error(f"_load_source: 解压遇到未知错误 {archive_name}: {e}")
+                QMessageBox.critical(self, "解压失败", f"无法打开压缩包: {e}")
+                return
+            _logger.info(f"_load_source: 解压完成 {archive_name}，共 {len(image_files)} 张图片")
+        else:
+            _logger.info(f"_load_source: 打开目录 {path}")
+            self.current_folder = path
+
+        # 清空旧缓存并加载文件列表
+        t0 = time.time()
+        self._clear_image_cache()
+        _logger.info(f"_load_source: _clear_image_cache 耗时 {time.time()-t0:.3f}s")
+        t1 = time.time()
+        self.load_file_list()
+        _logger.info(f"_load_source: load_file_list 耗时 {time.time()-t1:.3f}s")
+
+        # 状态栏文案
+        total = self.file_list.count()
+        if is_archive:
+            self.status_bar.showMessage(f"📦 {os.path.basename(path)} ({total} 页)")
+        else:
+            self.status_bar.showMessage(f"已加载: {os.path.basename(path)} ({total} 张)")
     
     def load_file_list(self):
         """
@@ -830,8 +894,22 @@ class MainWindow(QMainWindow):
                 pass  # 文件被占用或已删除，忽略
         self._temp_files.clear()
     
+    def _cleanup_archive_temp(self):
+        """
+        清理压缩包临时解压目录
+
+        在切换来源（打开新的文件夹/压缩包）和关闭程序时调用
+        """
+        if self._archive_temp_dir and os.path.exists(self._archive_temp_dir):
+            _logger.info(f"_cleanup_archive_temp: 清理临时目录 {self._archive_temp_dir}")
+            try:
+                shutil.rmtree(self._archive_temp_dir, ignore_errors=True)
+            except Exception as e:
+                _logger.warning(f"_cleanup_archive_temp: 清理失败 {e}")
+            self._archive_temp_dir = ""
+
     def closeEvent(self, event):
-        """窗口关闭时优雅停止所有后台线程并清理临时文件"""
+        """窗口关闭时优雅停止所有后台线程并清理临时目录和文件"""
         # 终止翻译 worker
         if self.worker and self.worker.isRunning():
             self.worker.terminate()
@@ -845,6 +923,9 @@ class MainWindow(QMainWindow):
                 worker.wait(3000)
                 worker.deleteLater()
         self.pending_loads.clear()
-        # 清理临时文件
+        # 清理临时文件（框选翻译产生的临时图片）
         self._clean_temp_files()
+        # 清理压缩包临时解压目录
+        self._cleanup_archive_temp()
+        # QA：清理完成，标记关闭事件已接受
         event.accept()
