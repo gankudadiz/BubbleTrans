@@ -21,7 +21,9 @@ BubbleTrans - 配置文件管理模块
         }
     },
     "target_lang": "简体中文",
-    "successful_models": ["gemini-2.5-flash"]
+    "successful_models": ["gemini-2.5-flash"],
+    "recent_folders": ["D:/manga/vol1", "D:/manga/vol2.cbz"],
+    "auto_open_last": true
 }
 
 注意事项：
@@ -124,3 +126,41 @@ def save_config(data):
     except Exception as e:
         print(f"Error saving config: {e}")
         return False
+
+
+# ============================================================================
+# 最近打开的文件夹管理
+# ============================================================================
+# 最多保留的最近路径数量
+MAX_RECENT_FOLDERS = 10
+
+
+def add_recent_folder(path: str):
+    """
+    将路径添加到最近打开列表
+
+    逻辑：
+    1. 加载现有配置
+    2. 从列表中移除已有相同路径（去重）
+    3. 插入到列表首位
+    4. 截断到 MAX_RECENT_FOLDERS 条
+    5. 保存
+
+    参数:
+        path: 文件夹或压缩包路径
+    """
+    config = load_config()
+    recent = config.get("recent_folders", [])
+
+    # 去重：移除已有相同路径
+    if path in recent:
+        recent.remove(path)
+
+    # 插入到首位
+    recent.insert(0, path)
+
+    # 截断
+    if len(recent) > MAX_RECENT_FOLDERS:
+        recent = recent[:MAX_RECENT_FOLDERS]
+
+    save_config({"recent_folders": recent})

@@ -36,6 +36,7 @@ from PyQt6.QtWidgets import (
     QSplitter,         # 可分割的窗口组件
     QFileDialog,       # 文件夹选择对话框
     QToolBar,          # 工具栏
+    QToolButton,       # 工具按钮（支持下拉菜单）
     QStatusBar,        # 状态栏
     QMessageBox,       # 消息对话框
     QApplication,      # 应用程序对象（用于获取屏幕信息）
@@ -44,6 +45,7 @@ from PyQt6.QtWidgets import (
     QFrame,            # 框架容器（骨架屏占位块）
     QCheckBox,         # 复选框
     QLineEdit,         # 单行文本输入框（搜索框）
+    QMenu,             # 弹出菜单
 )
 
 from PyQt6.QtGui import (
@@ -90,7 +92,7 @@ from ui.settings import SettingsDialog
 from engine.llm import llm_engine
 from utils.cache import TranslationCache
 import utils.archive as archive  # 压缩包支持
-from utils.config import load_config, save_config
+from utils.config import load_config, save_config, add_recent_folder
 
 
 # ============================================================================
@@ -356,6 +358,7 @@ class MainWindow(QMainWindow):
         
         # 实例变量初始化
         self.current_folder = ""      # 当前打开的文件夹路径
+        self._source_path = ""        # 原始来源路径（文件夹或压缩包路径，用于记录最近打开）
         self.worker = None            # 翻译工作线程实例
         self._temp_files = []         # 待清理的临时文件路径列表
         self._archive_temp_dir = ""   # 压缩包解压的临时目录（非空表示当前来源是压缩包）
@@ -391,6 +394,9 @@ class MainWindow(QMainWindow):
 
         # 首次启动：延迟弹出快捷键引导浮层（等窗口完整渲染后再弹）
         QTimer.singleShot(500, self._maybe_show_shortcut_overlay)
+
+        # 自动恢复上次打开的文件（延迟以确保窗口已初始化）
+        QTimer.singleShot(100, self._auto_restore_last)
     
     def init_ui(self):
         """
@@ -405,10 +411,19 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar()
         self.addToolBar(toolbar)
         
-        # "打开文件夹"按钮
-        open_action = QAction("Open Folder", self)
-        open_action.triggered.connect(self.open_folder)  # 点击时调用open_folder方法
-        toolbar.addAction(open_action)
+        # "打开文件夹"按钮（带最近打开路径下拉菜单）
+        self._open_btn = QToolButton()
+        self._open_btn.setText("Open Folder")
+        self._open_btn.setToolTip("打开文件夹 / 点击下拉箭头查看最近打开")
+        self._open_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self._open_btn.clicked.connect(self.open_folder)  # 按钮主体点击 → 弹出文件夹选择对话框
+        self._recent_menu = QMenu(self)
+        self._open_btn.setMenu(self._recent_menu)  # 下拉箭头 → 展开最近路径菜单
+        # 首次构建菜单
+        self._refresh_recent_menu()
+        # 菜单即将弹出时刷新（确保始终显示最新列表）
+        self._recent_menu.aboutToShow.connect(self._refresh_recent_menu)
+        toolbar.addWidget(self._open_btn)
 
         # "打开压缩包"按钮（新增：支持 .cbz / .zip 漫画压缩包）
         open_archive_action = QAction("Open Archive", self)
@@ -603,6 +618,34 @@ class MainWindow(QMainWindow):
         """手动触发快捷键引导浮层（工具栏按钮）"""
         overlay = ShortcutOverlay(self)
         overlay.exec()
+
+    def _auto_restore_last(self):
+        """启动时自动恢复上次打开的文件夹/压缩包"""
+        config = load_config()
+        if not config.get("auto_open_last", True):
+            return
+
+        recent = config.get("recent_folders", [])
+        if not recent:
+            return
+
+        # 遍历最近列表，找到第一个存在的路径
+        for path in recent:
+            if os.path.exists(path):
+                _logger.info(f"自动恢复: {path}")
+                ext = os.path.splitext(path)[1].lower()
+                if ext in ('.cbz', '.zip'):
+                    self._load_source(path, is_archive=True)
+                else:
+                    self._load_source(path, is_archive=False)
+                return
+            else:
+                # 路径不存在，从列表中移除
+                _logger.info(f"自动恢复: 路径不存在，移除 {path}")
+                recent.remove(path)
+
+        # 所有路径都不存在，保存更新后的列表
+        save_config({"recent_folders": recent})
     
     # ===================== 翻译进度辅助方法 =====================
     
@@ -719,6 +762,62 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"已清除 {count} 条翻译缓存", 5000)
 
     # ===================== 槽函数 =====================
+
+    def _refresh_recent_menu(self):
+        """刷新最近打开路径的下拉菜单"""
+        self._recent_menu.clear()
+        config = load_config()
+        recent = config.get("recent_folders", [])
+
+        if not recent:
+            # 空列表时显示禁用占位项
+            empty_action = self._recent_menu.addAction("（无最近记录）")
+            empty_action.setEnabled(False)
+        else:
+            for path in recent:
+                # 过长路径中间截断显示
+                display = self._truncate_path(path, max_len=60)
+                action = self._recent_menu.addAction(display)
+                action.setToolTip(path)  # hover 显示完整路径
+                action.triggered.connect(lambda checked, p=path: self._open_recent_path(p))
+
+        self._recent_menu.addSeparator()
+        clear_action = self._recent_menu.addAction("清除历史")
+        clear_action.triggered.connect(self._clear_recent)
+
+    @staticmethod
+    def _truncate_path(path: str, max_len: int = 60) -> str:
+        """过长路径中间截断，如 D:/very/.../long/path/file.cbz"""
+        if len(path) <= max_len:
+            return path
+        # 保留头尾各一半长度
+        half = (max_len - 3) // 2
+        return path[:half] + "..." + path[-half:]
+
+    def _open_recent_path(self, path: str):
+        """从最近路径菜单打开指定路径"""
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "路径不存在", f"以下路径已不存在，将自动移除：\n{path}")
+            # 移除不存在的路径
+            config = load_config()
+            recent = config.get("recent_folders", [])
+            if path in recent:
+                recent.remove(path)
+                save_config({"recent_folders": recent})
+            self._refresh_recent_menu()
+            return
+
+        # 判断是压缩包还是文件夹
+        ext = os.path.splitext(path)[1].lower()
+        if ext in ('.cbz', '.zip'):
+            self._load_source(path, is_archive=True)
+        else:
+            self._load_source(path, is_archive=False)
+
+    def _clear_recent(self):
+        """清除所有最近打开记录"""
+        save_config({"recent_folders": []})
+        self._refresh_recent_menu()
     
     def open_folder(self):
         """
@@ -758,6 +857,9 @@ class MainWindow(QMainWindow):
         # 清理上一次的压缩包临时目录（如有）
         self._cleanup_archive_temp()
 
+        # 记录原始来源路径（用于最近打开列表）
+        self._source_path = path
+
         if is_archive:
             archive_name = os.path.basename(path)
             _logger.info(f"_load_source: 解压压缩包 {archive_name}")
@@ -793,6 +895,9 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"📦 {os.path.basename(path)} ({total} 页)")
         else:
             self.status_bar.showMessage(f"已加载: {os.path.basename(path)} ({total} 张)")
+
+        # 记录到最近打开列表
+        add_recent_folder(self._source_path)
     
     def load_file_list(self):
         """
