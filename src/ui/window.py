@@ -44,7 +44,6 @@ from PyQt6.QtWidgets import (
     QFrame,            # 框架容器（骨架屏占位块）
     QCheckBox,         # 复选框
     QLineEdit,         # 单行文本输入框（搜索框）
-    QShortcut,         # 快捷键绑定（Ctrl+F / Esc）
 )
 
 from PyQt6.QtGui import (
@@ -52,6 +51,7 @@ from PyQt6.QtGui import (
     QIcon,             # 图标
     QPixmap,           # 图片对象，用于显示图像
     QKeySequence,      # 快捷键序列（QShortcut 绑定用）
+    QShortcut,         # 快捷键绑定（Ctrl+F / Esc）
 )
 
 from PyQt6.QtCore import (
