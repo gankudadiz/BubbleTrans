@@ -60,7 +60,7 @@ class TranslationCache:
     # ===================== 磁盘 I/O =====================
 
     def _load(self):
-        """从 JSON 文件加载缓存到内存"""
+        """从 JSON 文件加载缓存到内存，自动过滤错误条目"""
         if not os.path.exists(self.cache_path):
             _logger.info("缓存文件不存在，将创建新缓存")
             return
@@ -69,12 +69,20 @@ class TranslationCache:
             with open(self.cache_path, 'r', encoding='utf-8') as f:
                 raw = json.load(f)
             # 按时间戳升序插入（最早的在前面，LRU 淘汰时优先移除）
-            sorted_items = sorted(
-                raw.items(),
-                key=lambda kv: kv[1].get("timestamp", 0)
-            )
+            cleaned = 0
+            sorted_items = []
+            for key, entry in sorted(raw.items(), key=lambda kv: kv[1].get("timestamp", 0)):
+                if self._is_error_entry(entry):
+                    cleaned += 1
+                    continue
+                sorted_items.append((key, entry))
             self._data = OrderedDict(sorted_items)
-            _logger.info(f"已加载 {len(self._data)} 条翻译缓存")
+            if cleaned:
+                _logger.info(f"已加载 {len(self._data)} 条翻译缓存（自动过滤 {cleaned} 条错误缓存）")
+                # 立即写回磁盘，清除错误条目
+                self.save()
+            else:
+                _logger.info(f"已加载 {len(self._data)} 条翻译缓存")
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             _logger.warning(f"缓存文件损坏 ({e})，将创建新缓存")
             self._data = OrderedDict()
@@ -117,14 +125,19 @@ class TranslationCache:
 
         返回:
             命中时返回 {"original": str, "translated": str, "summary": dict}
-            未命中返回 None
+            未命中（或缓存为错误内容）返回 None
         """
         key = self._make_key(image_path, mtime)
         if key in self._data:
-            # 移到末尾（标记最近使用）
             self._data.move_to_end(key)
+            entry = self._data[key]
+            # 过滤错误缓存：原文为空且译文包含错误关键词
+            if self._is_error_entry(entry):
+                _logger.info(f"检测到错误缓存，跳过: {os.path.basename(image_path)}")
+                del self._data[key]
+                return None
             _logger.debug(f"缓存命中: {os.path.basename(image_path)}")
-            return self._data[key]
+            return entry
         return None
 
     def set(self, image_path, mtime, data):
@@ -164,7 +177,7 @@ class TranslationCache:
         """
         API 失败时的降级兜底：查找同一图片的任意历史缓存（忽略 mtime）
 
-        从最新到最旧遍历，返回第一个匹配的缓存条目。
+        从最新到最旧遍历，返回第一个匹配的非错误缓存条目。
         用于 API 暂时不可用时仍能展示该图片的上一次翻译结果。
 
         参数:
@@ -172,14 +185,68 @@ class TranslationCache:
 
         返回:
             命中时返回 {"original": str, "translated": str, "summary": dict}
-            无历史缓存时返回 None
+            无历史缓存（或仅有错误缓存）时返回 None
         """
         for key in reversed(self._data):
             entry = self._data[key]
             if entry.get("image_path") == image_path:
+                if self._is_error_entry(entry):
+                    continue  # 跳过错误缓存
                 _logger.info(f"缓存降级命中: {os.path.basename(image_path)}")
                 return entry
         return None
+
+    # ===================== 缓存管理 =====================
+
+    def _is_error_entry(self, entry):
+        """
+        判断缓存条目是否为错误内容（如 API 限流 429 错误文本）
+
+        错误缓存特征：原文为空，译文以 "Error:" / "API Error:" 开头或包含错误码
+        """
+        original = entry.get("original", "")
+        translated = entry.get("translated", "")
+        if not original and translated:
+            if translated.startswith("Error:") or translated.startswith("API Error:"):
+                return True
+            if "Error code:" in translated:
+                return True
+        return False
+
+    def clear_image(self, image_path):
+        """
+        清除指定图片的所有缓存条目（忽略 mtime）
+
+        参数:
+            image_path: 图片文件路径
+        返回:
+            清除的条目数
+        """
+        removed = 0
+        keys_to_remove = []
+        for key, entry in self._data.items():
+            if entry.get("image_path") == image_path:
+                keys_to_remove.append(key)
+        for key in keys_to_remove:
+            del self._data[key]
+            removed += 1
+        if removed:
+            _logger.info(f"已清除 {image_path} 的 {removed} 条缓存")
+            self.save()
+        return removed
+
+    def clear(self):
+        """
+        清除全部缓存
+
+        返回:
+            清除的条目数
+        """
+        count = len(self._data)
+        self._data.clear()
+        self.save()
+        _logger.info(f"已清除全部缓存 ({count} 条)")
+        return count
 
     def __len__(self):
         """返回当前缓存条目数"""
