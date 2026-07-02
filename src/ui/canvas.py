@@ -380,7 +380,15 @@ class ImageCanvas(QGraphicsView):
         super().leaveEvent(event)
     
     def keyPressEvent(self, event: QKeyEvent):
-        """键盘事件：左右方向键翻页"""
+        """键盘事件：左右方向键翻页，Esc 取消框选"""
+        # Esc 键取消框选
+        if event.key() == Qt.Key.Key_Escape:
+            if self.is_selecting:
+                self.rubber_band.hide()
+                self.is_selecting = False
+                event.accept()
+                return
+            # 未在框选时不做处理，交由父类处理
         if event.key() == Qt.Key.Key_Left:
             self.nav_prev.emit()
         elif event.key() == Qt.Key.Key_Right:

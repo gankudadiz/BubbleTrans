@@ -42,12 +42,16 @@ from PyQt6.QtWidgets import (
     QDialog,           # 对话框基类
     QDialogButtonBox,  # 按钮盒（确定/取消按钮组）
     QFrame,            # 框架容器（骨架屏占位块）
+    QCheckBox,         # 复选框
+    QLineEdit,         # 单行文本输入框（搜索框）
+    QShortcut,         # 快捷键绑定（Ctrl+F / Esc）
 )
 
 from PyQt6.QtGui import (
     QAction,           # 动作（可绑定到工具栏按钮）
     QIcon,             # 图标
-    QPixmap            # 图片对象，用于显示图像
+    QPixmap,           # 图片对象，用于显示图像
+    QKeySequence,      # 快捷键序列（QShortcut 绑定用）
 )
 
 from PyQt6.QtCore import (
@@ -86,6 +90,7 @@ from ui.settings import SettingsDialog
 from engine.llm import llm_engine
 from utils.cache import TranslationCache
 import utils.archive as archive  # 压缩包支持
+from utils.config import load_config, save_config
 
 
 # ============================================================================
@@ -228,6 +233,96 @@ class CropConfirmDialog(QDialog):
 
 
 # ============================================================================
+# ShortcutOverlay 类 - 首次启动快捷键引导浮层
+# ============================================================================
+class ShortcutOverlay(QDialog):
+    """首次启动时的快捷键引导浮层 — 半透明遮罩 + 居中暗色卡片"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("快捷键指南")
+        self.setModal(True)
+
+        # 无边框 + 透明背景（用于实现圆角遮罩效果）
+        self.setWindowFlags(
+            Qt.WindowType.Dialog |
+            Qt.WindowType.FramelessWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        # 主布局
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        # 暗色卡片容器
+        card = QFrame()
+        card.setObjectName("shortcutCard")
+        card.setStyleSheet("""
+            QFrame#shortcutCard {
+                background-color: #2b2b2b;
+                border: 1px solid #555;
+                border-radius: 10px;
+            }
+        """)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(24, 20, 24, 20)
+        card_layout.setSpacing(12)
+
+        # 标题
+        title = QLabel("⌨ 快捷键指南")
+        title.setStyleSheet("color: #ffffff; font-size: 16px; font-weight: bold;")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_layout.addWidget(title)
+
+        # 快捷键表格（用 QLabel 模拟）
+        shortcuts_text = """
+        <table style="color:#cccccc; font-size:13px; width:100%%; border-spacing:8px;">
+        <tr><td style="color:#8ab4f8;">← →</td><td>上一页 / 下一页</td></tr>
+        <tr><td style="color:#8ab4f8;">右键拖拽</td><td>框选翻译区域</td></tr>
+        <tr><td style="color:#8ab4f8;">滚轮</td><td>缩放图片</td></tr>
+        <tr><td style="color:#8ab4f8;">Esc</td><td>取消框选</td></tr>
+        <tr><td style="color:#8ab4f8;">F5</td><td>翻译当前页</td></tr>
+        </table>
+        """
+        shortcuts_label = QLabel(shortcuts_text)
+        shortcuts_label.setTextFormat(Qt.TextFormat.RichText)
+        shortcuts_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_layout.addWidget(shortcuts_label)
+
+        # "不再提示"复选框
+        self.dont_show_check = QCheckBox("不再提示")
+        self.dont_show_check.setStyleSheet("color: #999; font-size: 12px;")
+        card_layout.addWidget(self.dont_show_check, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        # 关闭按钮
+        close_btn = QPushButton("知道了")
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3a7bd5;
+                color: #ffffff;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 32px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #4a8be5;
+            }
+            QPushButton:pressed {
+                background-color: #2a6bc5;
+            }
+        """)
+        close_btn.clicked.connect(self.accept)
+        card_layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        layout.addWidget(card)
+
+    def should_not_show_again(self) -> bool:
+        """返回用户是否勾选了"不再提示" """
+        return self.dont_show_check.isChecked()
+
+
+# ============================================================================
 # MainWindow 类 - 主窗口
 # ============================================================================
 # 应用程序的主窗口，继承自QMainWindow
@@ -293,6 +388,9 @@ class MainWindow(QMainWindow):
 
         # 初始化UI
         self.init_ui()
+
+        # 首次启动：延迟弹出快捷键引导浮层（等窗口完整渲染后再弹）
+        QTimer.singleShot(500, self._maybe_show_shortcut_overlay)
     
     def init_ui(self):
         """
@@ -317,9 +415,15 @@ class MainWindow(QMainWindow):
         open_archive_action.triggered.connect(self.open_archive)
         toolbar.addAction(open_archive_action)
 
+        # "快捷键"说明按钮
+        shortcuts_action = QAction("Shortcuts", self)
+        shortcuts_action.triggered.connect(self._show_shortcut_overlay)
+        toolbar.addAction(shortcuts_action)
+
         # "设置"按钮
         settings_action = QAction("Settings", self)
         settings_action.triggered.connect(self.open_settings)
+        settings_action.setToolTip("设置 (快捷键、API 配置)")
         toolbar.addAction(settings_action)
         
         # ===== 主布局 =====
@@ -331,11 +435,34 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(splitter)
         
-        # --- 1. 文件列表（左侧，固定宽度200px）---
+        # --- 1. 左侧面板（搜索框 + 文件列表，固定宽度200px）---
+        # 容器 widget：包裹搜索框和文件列表，作为整体加入 QSplitter
+        left_panel = QWidget()
+        left_panel.setFixedWidth(200)
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(4)
+
+        # 搜索框（顶部）
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("🔍 搜索文件名…")
+        self.search_box.setClearButtonEnabled(True)  # 右侧 X 按钮一键清空
+        self.search_box.textChanged.connect(self.filter_file_list)  # 实时过滤
+        left_layout.addWidget(self.search_box)
+
+        # 文件列表（下部，占据剩余空间）
         self.file_list = QListWidget()
-        self.file_list.setFixedWidth(200)
         self.file_list.itemClicked.connect(self.load_image)  # 点击文件时加载图片
-        splitter.addWidget(self.file_list)
+        left_layout.addWidget(self.file_list)
+
+        splitter.addWidget(left_panel)
+
+        # 快捷键绑定
+        # Ctrl+F：聚焦搜索框（context=self，主窗口任意位置可用）
+        QShortcut(QKeySequence("Ctrl+F"), self, self._focus_search_box)
+        # Esc：清空搜索框（context=self.search_box，仅搜索框有焦点时触发）
+        # Qt 在 shortcut 层拦截 Esc，不经过 keyPressEvent，避免与画布/主窗口冲突
+        QShortcut(QKeySequence("Escape"), self.search_box, self._clear_search)
         
         # --- 2. 图片画布（中间，自适应扩展）---
         self.canvas = ImageCanvas()
@@ -455,6 +582,27 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("BubbleTrans v2.0 - 就绪")
+        # 状态栏右侧常驻快捷键提示
+        shortcut_hint_label = QLabel("← → 翻页 | 右键框选 | 滚轮缩放")
+        shortcut_hint_label.setStyleSheet("color: #777; font-size: 11px; padding-right: 8px;")
+        self.status_bar.addPermanentWidget(shortcut_hint_label)
+    
+    # ===================== 首次启动引导 =====================
+    
+    def _maybe_show_shortcut_overlay(self):
+        """如果用户从未看过快捷键引导，则弹出 ShortcutOverlay"""
+        config = load_config()
+        if config.get("shortcut_hint_shown"):
+            return
+        overlay = ShortcutOverlay(self)
+        overlay.exec()
+        if overlay.should_not_show_again():
+            save_config({"shortcut_hint_shown": True})
+
+    def _show_shortcut_overlay(self):
+        """手动触发快捷键引导浮层（工具栏按钮）"""
+        overlay = ShortcutOverlay(self)
+        overlay.exec()
     
     # ===================== 翻译进度辅助方法 =====================
     
@@ -649,13 +797,13 @@ class MainWindow(QMainWindow):
     def load_file_list(self):
         """
         加载文件列表
-        
+
         从当前文件夹中读取图片文件，并显示在左侧列表中
         支持的图片格式：jpg, jpeg, png, webp, bmp
         """
         self.file_list.clear()
         valid_exts = ['.jpg', '.jpeg', '.png', '.webp', '.bmp']
-        
+
         try:
             # 获取文件夹中所有符合条件的文件
             t0 = time.time()
@@ -671,6 +819,40 @@ class MainWindow(QMainWindow):
         except Exception as e:
             _logger.error(f"load_file_list 失败: {e}")
             QMessageBox.critical(self, "Error", f"Failed to load folder: {e}")
+
+    # ===================== 文件搜索 =====================
+
+    def filter_file_list(self, query: str):
+        """
+        根据搜索框输入实时过滤文件列表
+
+        遍历所有 item，将不匹配的项 setHidden(True)。
+        空 query 时恢复全部显示。
+
+        参数:
+            query: 搜索框中的文本（已自动触发 textChanged 信号）
+        """
+        query = query.strip().lower()
+        for i in range(self.file_list.count()):
+            item = self.file_list.item(i)
+            if not query:
+                item.setHidden(False)
+            else:
+                item.setHidden(query not in item.text().lower())
+
+    def _focus_search_box(self):
+        """Ctrl+F 快捷键槽：聚焦搜索框并全选当前文本"""
+        self.search_box.setFocus()
+        self.search_box.selectAll()
+
+    def _clear_search(self):
+        """
+        Esc 快捷键槽（仅搜索框有焦点时触发）：清空搜索框并失去焦点
+
+        焦点回到文件列表，方便用户继续用方向键浏览。
+        """
+        self.search_box.clear()
+        self.file_list.setFocus()
     
     def load_image(self, item):
         """
@@ -802,16 +984,26 @@ class MainWindow(QMainWindow):
         self._navigate_page(1)
     
     def _navigate_page(self, delta: int):
-        """执行翻页：修改文件列表选中项并触发图片加载"""
+        """
+        执行翻页：修改文件列表选中项并触发图片加载
+
+        过滤状态下自动跳过隐藏项，跳到下一个可见项；
+        如果方向上没有可见项（到达边界），则不翻页。
+        """
         count = self.file_list.count()
         if count == 0:
             return
         current = self.file_list.currentRow()
-        new_row = current + delta
-        if 0 <= new_row < count:
-            self.file_list.setCurrentRow(new_row)
-            item = self.file_list.item(new_row)
-            self.load_image(item)
+        new_row = current
+        while True:
+            new_row += delta
+            if new_row < 0 or new_row >= count:
+                return  # 边界外，不翻页
+            if not self.file_list.item(new_row).isHidden():
+                break
+        self.file_list.setCurrentRow(new_row)
+        item = self.file_list.item(new_row)
+        self.load_image(item)
     
     def _update_page_info(self):
         """刷新画布上的页码指示器和按钮可用状态"""
@@ -1018,8 +1210,10 @@ class MainWindow(QMainWindow):
         self.worker.start()
     
     def keyPressEvent(self, event):
-        """键盘快捷键：左右方向键翻页（画布未聚焦时也可用）"""
-        if event.key() == Qt.Key.Key_Left:
+        """键盘快捷键：左右方向键翻页、F5 翻译当前页（画布未聚焦时也可用）"""
+        if event.key() == Qt.Key.Key_F5:
+            self.translate_current_page()
+        elif event.key() == Qt.Key.Key_Left:
             self._nav_prev_page()
         elif event.key() == Qt.Key.Key_Right:
             self._nav_next_page()
