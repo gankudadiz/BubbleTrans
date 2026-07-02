@@ -40,7 +40,8 @@ from PyQt6.QtWidgets import (
     QMessageBox,       # 消息对话框
     QApplication,      # 应用程序对象（用于获取屏幕信息）
     QDialog,           # 对话框基类
-    QDialogButtonBox   # 按钮盒（确定/取消按钮组）
+    QDialogButtonBox,  # 按钮盒（确定/取消按钮组）
+    QFrame,            # 框架容器（骨架屏占位块）
 )
 
 from PyQt6.QtGui import (
@@ -52,7 +53,9 @@ from PyQt6.QtGui import (
 from PyQt6.QtCore import (
     Qt,                # 常量定义（如对齐方式）
     QThread,           # 线程基类
-    pyqtSignal         # 信号定义（线程间通信）
+    pyqtSignal,        # 信号定义（线程间通信）
+    QTimer,            # 定时器（按钮动画）
+    QPropertyAnimation,# 属性动画（骨架屏脉冲）
 )
 
 # ============================================================================
@@ -102,10 +105,10 @@ import utils.archive as archive  # 压缩包支持
 # ============================================================================
 class TranslationWorker(QThread):
     # 定义信号，pyqtSignal用于跨线程通信
-    # (str, str) 表示信号携带两个字符串参数
     finished = pyqtSignal(str, str, dict)  # origin_text, translated_text, summary_dict
     error = pyqtSignal(str)                # 错误信息
-    status = pyqtSignal(str)               # 状态信息
+    status = pyqtSignal(str)               # 状态信息（已弃用，保留兼容）
+    stage_changed = pyqtSignal(str)        # 阶段变化（编码/等待/解析/完成）
     
     def __init__(self, image_path):
         """
@@ -122,10 +125,12 @@ class TranslationWorker(QThread):
         线程主函数 - 直接使用LLM翻译图片
         
         使用LLM的视觉能力直接识别并翻译图片中的文字
+        分阶段发射进度信号供 UI 层更新状态栏
         """
         try:
-            self.status.emit("翻译中…")
+            self.stage_changed.emit("正在翻译…")
             origin_text, translated_text, summary_dict = llm_engine.translate_image(self.image_path)
+            self.stage_changed.emit("正在解析…")
             self.finished.emit(origin_text, translated_text, summary_dict)
         except Exception as e:
             self.error.emit(str(e))
@@ -277,7 +282,15 @@ class MainWindow(QMainWindow):
         # 初始化翻译缓存（注入到全局 llm_engine 实例）
         self.translation_cache = TranslationCache()
         llm_engine.cache = self.translation_cache
-        
+
+        # === 翻译进度动画 ===
+        # 按钮加载动画：3 点省略号循环
+        self._spinner_dots = 0
+        self._spinner_timer = QTimer()
+        self._spinner_timer.timeout.connect(self._update_spinner)
+        # 骨架屏脉冲动画
+        self._skeleton_pulse = None
+
         # 初始化UI
         self.init_ui()
     
@@ -336,11 +349,16 @@ class MainWindow(QMainWindow):
         right_panel.setFixedWidth(300)
         right_layout = QVBoxLayout(right_panel)
         
-        # --- 按钮行（保持不变）---
+        # --- 按钮行 ---
         tool_row = QHBoxLayout()
         self.translate_page_btn = QPushButton("翻译当前页")
         self.translate_page_btn.clicked.connect(self.translate_current_page)
         tool_row.addWidget(self.translate_page_btn)
+        # 清除缓存按钮（小字，非主要操作）
+        self.clear_cache_btn = QPushButton("清除缓存")
+        self.clear_cache_btn.setStyleSheet("QPushButton { color: #888; font-size: 11px; padding: 2px 8px; }")
+        self.clear_cache_btn.clicked.connect(self._clear_translation_cache)
+        tool_row.addWidget(self.clear_cache_btn)
         tool_row.addStretch()
         # 语言标签（从 llm_engine.target_lang 读取）
         self.lang_label = QLabel(f"语言: {llm_engine.target_lang}")
@@ -421,6 +439,10 @@ class MainWindow(QMainWindow):
         
         right_layout.addWidget(self.right_splitter)
         
+        # --- 骨架屏（翻译等待时覆盖文本区域）---
+        self.skeleton_widget = self._create_skeleton()
+        right_layout.addWidget(self.skeleton_widget)
+        
         splitter.addWidget(right_panel)
         
         # 设置分割器初始比例：[200, 600, 300]
@@ -434,6 +456,120 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("BubbleTrans v2.0 - 就绪")
     
+    # ===================== 翻译进度辅助方法 =====================
+    
+    def _create_skeleton(self):
+        """创建右侧面板骨架屏（翻译等待时的灰色占位块）"""
+        widget = QWidget()
+        widget.setObjectName("skeletonWidget")
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(8)
+
+        bar_style = "background-color: #3a3a3a; border-radius: 3px;"
+
+        # 上半部分 —— 模拟多条文本行（不同宽度模拟真实排版）
+        top = QWidget()
+        top_layout = QVBoxLayout(top)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(6)
+        for w_pct in (0.95, 0.88, 0.72, 0.93, 0.65, 0.85):
+            bar = QFrame()
+            bar.setStyleSheet(bar_style)
+            bar.setFixedHeight(12)
+            # 用 stretch + dummy 控制宽度比例
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            bar.setFixedWidth(int(290 * w_pct))
+            row.addWidget(bar)
+            row.addStretch()
+            row_wrapper = QWidget()
+            row_wrapper.setLayout(row)
+            top_layout.addWidget(row_wrapper)
+        top_layout.addStretch()
+        layout.addWidget(top, 2)
+
+        # 分割线
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("background-color: #444;")
+        sep.setFixedHeight(1)
+        layout.addWidget(sep)
+
+        # 下半部分 —— 模拟总结区
+        bottom = QWidget()
+        bottom_layout = QVBoxLayout(bottom)
+        bottom_layout.setContentsMargins(0, 4, 0, 0)
+        bottom_layout.setSpacing(6)
+
+        title = QFrame()
+        title.setStyleSheet(bar_style)
+        title.setFixedHeight(14)
+        title.setFixedWidth(80)
+        bottom_layout.addWidget(title)
+
+        for w_pct in (0.90, 0.75, 0.60):
+            bar = QFrame()
+            bar.setStyleSheet(bar_style)
+            bar.setFixedHeight(12)
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            bar.setFixedWidth(int(290 * w_pct))
+            row.addWidget(bar)
+            row.addStretch()
+            row_wrapper = QWidget()
+            row_wrapper.setLayout(row)
+            bottom_layout.addWidget(row_wrapper)
+        bottom_layout.addStretch()
+        layout.addWidget(bottom, 1)
+
+        widget.hide()
+        return widget
+
+    def _show_skeleton(self, visible):
+        """切换骨架屏与文本区域的可见性"""
+        self.skeleton_widget.setVisible(visible)
+        self.right_splitter.setVisible(not visible)
+
+    def _start_skeleton_pulse(self):
+        """骨架屏脉冲动画"""
+        from PyQt6.QtWidgets import QGraphicsOpacityEffect
+        if self._skeleton_pulse is None:
+            effect = QGraphicsOpacityEffect(self.skeleton_widget)
+            self.skeleton_widget.setGraphicsEffect(effect)
+            self._skeleton_pulse = QPropertyAnimation(effect, b"opacity")
+            self._skeleton_pulse.setDuration(1000)
+            self._skeleton_pulse.setStartValue(0.35)
+            self._skeleton_pulse.setEndValue(0.85)
+            self._skeleton_pulse.setLoopCount(-1)  # 无限循环
+        self._skeleton_pulse.start()
+
+    def _stop_skeleton_pulse(self):
+        """停止骨架屏脉冲动画"""
+        if self._skeleton_pulse:
+            self._skeleton_pulse.stop()
+
+    def _update_spinner(self):
+        """按钮加载动画：省略号循环（.  ..  ...）"""
+        self._spinner_dots = (self._spinner_dots + 1) % 4
+        dots = "." * self._spinner_dots
+        self.translate_page_btn.setText(f"翻译中{dots}")
+
+    def _clear_translation_cache(self):
+        """清除全部翻译缓存（带确认对话框）"""
+        count = len(self.translation_cache)
+        if count == 0:
+            self.status_bar.showMessage("缓存为空，无需清除", 3000)
+            return
+        reply = QMessageBox.question(
+            self, "清除翻译缓存",
+            f"当前共有 {count} 条翻译缓存。\n清除后需要重新翻译所有页面。\n\n确定清除吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.translation_cache.clear()
+            self.status_bar.showMessage(f"已清除 {count} 条翻译缓存", 5000)
+
     # ===================== 槽函数 =====================
     
     def open_folder(self):
@@ -756,7 +892,7 @@ class MainWindow(QMainWindow):
             # 启动翻译工作线程
             self.worker = TranslationWorker(temp_path)
             # 连接信号（线程完成时更新UI）
-            self.worker.status.connect(self.status_bar.showMessage)
+            self.worker.stage_changed.connect(self._on_translation_stage)
             self.worker.finished.connect(self.on_translation_finished)
             self.worker.error.connect(self.on_translation_error)
             self.worker.start()  # 启动线程
@@ -764,6 +900,10 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"保存临时图片失败: {e}")
     
+    def _on_translation_stage(self, stage: str):
+        """翻译阶段变化 → 更新状态栏"""
+        self.status_bar.showMessage(stage)
+
     def on_translation_finished(self, origin_text, translated_text, summary_dict):
         """
         翻译完成回调函数
@@ -837,12 +977,18 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "翻译失败", error_msg)
     
     def _set_translating(self, active: bool):
-        """设置翻译进行中状态，防止重复点击"""
+        """设置翻译进行中状态，防止重复点击，并切换骨架屏/按钮动画"""
         self.translate_page_btn.setEnabled(not active)
         if active:
-            self.translate_page_btn.setText("翻译中…")
+            self._spinner_dots = 0
+            self._spinner_timer.start(500)   # 每 0.5s 切换省略号
+            self._show_skeleton(True)
+            self._start_skeleton_pulse()
         else:
+            self._spinner_timer.stop()
             self.translate_page_btn.setText("翻译当前页")
+            self._show_skeleton(False)
+            self._stop_skeleton_pulse()
             # 如果有进行中的 worker，安全终止它
             if self.worker and self.worker.isRunning():
                 self.worker.terminate()
@@ -861,14 +1007,12 @@ class MainWindow(QMainWindow):
         image_path = self.canvas._current_image_path
         self._translating_image_path = image_path  # 记录路径用于缓存写回
         self._set_translating(True)
-        self.status_bar.showMessage("翻译中…")
         self.origin_text = ""
         self.translated_text = ""
         self.shared_text_edit.clear()
-        self.shared_text_edit.setText("翻译中…")
         
         self.worker = TranslationWorker(image_path)
-        self.worker.status.connect(self.status_bar.showMessage)
+        self.worker.stage_changed.connect(self._on_translation_stage)
         self.worker.finished.connect(self.on_translation_finished)
         self.worker.error.connect(self.on_translation_error)
         self.worker.start()
