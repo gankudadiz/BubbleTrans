@@ -634,7 +634,7 @@ class MainWindow(QMainWindow):
             if os.path.exists(path):
                 _logger.info(f"自动恢复: {path}")
                 ext = os.path.splitext(path)[1].lower()
-                if ext in ('.cbz', '.zip'):
+                if ext in ('.cbz', '.zip', '.cbr'):
                     self._load_source(path, is_archive=True)
                 else:
                     self._load_source(path, is_archive=False)
@@ -809,7 +809,7 @@ class MainWindow(QMainWindow):
 
         # 判断是压缩包还是文件夹
         ext = os.path.splitext(path)[1].lower()
-        if ext in ('.cbz', '.zip'):
+        if ext in ('.cbz', '.zip', '.cbr'):
             self._load_source(path, is_archive=True)
         else:
             self._load_source(path, is_archive=False)
