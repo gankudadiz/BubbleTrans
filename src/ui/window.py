@@ -841,7 +841,7 @@ class MainWindow(QMainWindow):
             self,
             "Open Comic Archive",
             "",
-            "Comic Archive (*.cbz *.zip)"
+            "Comic Archive (*.cbz *.zip *.cbr)"
         )
         if file_path:
             self._load_source(file_path, is_archive=True)
