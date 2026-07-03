@@ -164,3 +164,60 @@ def add_recent_folder(path: str):
         recent = recent[:MAX_RECENT_FOLDERS]
 
     save_config({"recent_folders": recent})
+
+
+# ============================================================================
+# 阅读位置记忆（F7）
+# ============================================================================
+# 最多记录的文件夹阅读位置数
+MAX_LAST_POSITIONS = 20
+
+
+def save_last_position(folder_path: str, page_index: int):
+    """
+    保存某个文件夹的阅读位置
+
+    逻辑：
+    1. 加载现有配置
+    2. 若已存在则先移除（移到末尾 → 标记最近写入）
+    3. 写入新位置
+    4. 超出 MAX_LAST_POSITIONS 时淘汰最旧的条目
+    5. 持久化到 config.json
+
+    参数:
+        folder_path: 文件夹绝对路径（与 current_folder 一致）
+        page_index: 文件列表中的索引（0-based），负值忽略
+    """
+    if page_index < 0:
+        return
+
+    config = load_config()
+    positions = config.get("last_positions", {})
+
+    # 如果已存在，先移除再插入（移到末尾，标记为最近写入）
+    if folder_path in positions:
+        del positions[folder_path]
+
+    positions[folder_path] = page_index
+
+    # LRU 淘汰：超出上限时移除最旧的（Python 3.7+ dict 保持插入顺序）
+    while len(positions) > MAX_LAST_POSITIONS:
+        oldest = next(iter(positions))
+        del positions[oldest]
+
+    save_config({"last_positions": positions})
+
+
+def get_last_position(folder_path: str) -> int:
+    """
+    读取某个文件夹的阅读位置
+
+    参数:
+        folder_path: 文件夹绝对路径
+
+    返回:
+        上次阅读的页码索引（0-based），不存在返回 -1
+    """
+    config = load_config()
+    positions = config.get("last_positions", {})
+    return positions.get(folder_path, -1)

@@ -92,7 +92,7 @@ from ui.settings import SettingsDialog
 from engine.llm import llm_engine
 from utils.cache import TranslationCache
 import utils.archive as archive  # 压缩包支持
-from utils.config import load_config, save_config, add_recent_folder
+from utils.config import load_config, save_config, add_recent_folder, save_last_position, get_last_position
 
 
 # ============================================================================
@@ -857,6 +857,10 @@ class MainWindow(QMainWindow):
         # 清理上一次的压缩包临时目录（如有）
         self._cleanup_archive_temp()
 
+        # 保存旧来源的阅读位置（F7：切换前记录；用 _source_path 作键，对压缩包稳定）
+        if self._source_path and self.current_file_index >= 0:
+            save_last_position(self._source_path, self.current_file_index)
+
         # 记录原始来源路径（用于最近打开列表）
         self._source_path = path
 
@@ -924,6 +928,19 @@ class MainWindow(QMainWindow):
         except Exception as e:
             _logger.error(f"load_file_list 失败: {e}")
             QMessageBox.critical(self, "Error", f"Failed to load folder: {e}")
+
+        # 恢复上次阅读位置（F7：用 _source_path 作键，对压缩包稳定）
+        if self.file_list.count() > 0:
+            saved_idx = get_last_position(self._source_path)
+            if 0 <= saved_idx < self.file_list.count():
+                self.file_list.setCurrentRow(saved_idx)
+                self.current_file_index = saved_idx
+                item = self.file_list.item(saved_idx)
+                self.load_image(item)
+            else:
+                self.file_list.setCurrentRow(0)
+                item = self.file_list.item(0)
+                self.load_image(item)
 
     # ===================== 文件搜索 =====================
 
@@ -1229,7 +1246,10 @@ class MainWindow(QMainWindow):
                         "summary": summary_dict,
                     })
                     self.translation_cache.save()
-            self._translating_image_path = ""
+
+        # 无论是否缓存命中，都重置翻译路径标记
+        # Bug修复：之前仅在缓存未命中时重置，导致缓存命中后此标记残留
+        self._translating_image_path = ""
 
         # 自动切换到译文 tab
         self._switch_tab("trans")
@@ -1273,6 +1293,36 @@ class MainWindow(QMainWindow):
         self._set_translating(False)
         QMessageBox.warning(self, "翻译失败", error_msg)
     
+    def _cleanup_worker(self):
+        """
+        安全清理翻译线程：先断开信号连接再终止，防止残留信号干扰后续翻译
+
+        修复背景：旧代码直接用 terminate() 杀死线程，但没有先断开信号。
+        虽然 terminate() 后信号不会 emit，但在极端的竞态窗口（run() 即将
+        emit 时被 terminate），可能导致信号队列中有待处理事件。
+        """
+        if self.worker is None:
+            return
+        # 先断开信号连接，彻底断绝信号到达的可能性
+        try:
+            self.worker.stage_changed.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            self.worker.finished.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            self.worker.error.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+        # 如果线程仍在运行，强制终止
+        if self.worker.isRunning():
+            self.worker.terminate()
+            self.worker.wait(500)
+        self.worker.deleteLater()
+        self.worker = None
+
     def _set_translating(self, active: bool):
         """设置翻译进行中状态，防止重复点击，并切换骨架屏/按钮动画"""
         self.translate_page_btn.setEnabled(not active)
@@ -1286,17 +1336,16 @@ class MainWindow(QMainWindow):
             self.translate_page_btn.setText("翻译当前页")
             self._show_skeleton(False)
             self._stop_skeleton_pulse()
-            # 如果有进行中的 worker，安全终止它
-            if self.worker and self.worker.isRunning():
-                self.worker.terminate()
-                self.worker.wait(500)        # 等待线程结束（最多0.5秒）
-                self.worker.deleteLater()    # 安全释放 Qt 资源
-                self.worker = None
+            # 安全清理旧 worker（先断开信号再终止）
+            self._cleanup_worker()
             # 清理残留的临时文件
             self._clean_temp_files()
     
     def translate_current_page(self):
         """翻译当前画布中显示的整张图片"""
+        # 重入保护：先清理上一个 worker，防止新旧 worker 竞争
+        self._cleanup_worker()
+
         if not hasattr(self.canvas, '_current_image_path') or not self.canvas._current_image_path:
             self.status_bar.showMessage("请先打开一张图片", 3000)
             return
@@ -1353,6 +1402,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """窗口关闭时优雅停止所有后台线程并清理临时目录和文件"""
+        # 保存当前阅读位置（F7：关闭前记录；用 _source_path 作键，对压缩包稳定）
+        if self._source_path and self.current_file_index >= 0:
+            save_last_position(self._source_path, self.current_file_index)
+
         # 终止翻译 worker
         if self.worker and self.worker.isRunning():
             self.worker.terminate()
