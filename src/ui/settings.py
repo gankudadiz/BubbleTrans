@@ -290,6 +290,22 @@ class SettingsDialog(QDialog):
             self.lang_combo.setCurrentIndex(idx)
         form.addRow("目标语言:", self.lang_combo)
         
+        # ===== 预翻译设置 =====
+        self.prefetch_check = QCheckBox("翻页时自动预翻译")
+        config = load_config()
+        self.prefetch_check.setChecked(config.get("prefetch_enabled", False))
+        form.addRow("", self.prefetch_check)
+
+        self.prefetch_count_combo = QComboBox()
+        self.prefetch_count_combo.addItems(["1", "3", "5"])
+        self.prefetch_count_combo.setCurrentText(str(config.get("prefetch_count", 3)))
+        form.addRow("预翻译页数:", self.prefetch_count_combo)
+
+        self.prefetch_concurrent_combo = QComboBox()
+        self.prefetch_concurrent_combo.addItems(["1", "2", "3"])
+        self.prefetch_concurrent_combo.setCurrentText(str(config.get("prefetch_concurrent", 2)))
+        form.addRow("并发数:", self.prefetch_concurrent_combo)
+        
         layout.addLayout(form)
         
         # ===== 提示信息 =====
@@ -448,6 +464,9 @@ class SettingsDialog(QDialog):
         save_config({
             "target_lang": llm_engine.target_lang,
             "use_vision": True,
+            "prefetch_enabled": self.prefetch_check.isChecked(),
+            "prefetch_count": int(self.prefetch_count_combo.currentText()),
+            "prefetch_concurrent": int(self.prefetch_concurrent_combo.currentText()),
         })
         
         # 关闭对话框

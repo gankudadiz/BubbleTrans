@@ -93,6 +93,7 @@ from engine.llm import llm_engine
 from utils.cache import TranslationCache
 import utils.archive as archive  # 压缩包支持
 from utils.config import load_config, save_config, add_recent_folder, save_last_position, get_last_position
+from ui.prefetch import PrefetchManager
 
 
 # ============================================================================
@@ -381,6 +382,16 @@ class MainWindow(QMainWindow):
         self.translation_cache = TranslationCache()
         llm_engine.cache = self.translation_cache
 
+        # === 预翻译管理器 ===
+        _cfg = load_config()
+        self.prefetch_manager = PrefetchManager(
+            self.translation_cache,
+            max_concurrent=_cfg.get("prefetch_concurrent", 2),
+        )
+        self.prefetch_manager.progress_changed.connect(self._on_prefetch_progress)
+        self.prefetch_manager.page_completed.connect(self._on_prefetch_page_completed)
+        self.prefetch_manager.all_completed.connect(self._on_prefetch_all_completed)
+
         # === 翻译进度动画 ===
         # 按钮加载动画：3 点省略号循环
         self._spinner_dots = 0
@@ -496,6 +507,17 @@ class MainWindow(QMainWindow):
         self.translate_page_btn = QPushButton("翻译当前页")
         self.translate_page_btn.clicked.connect(self.translate_current_page)
         tool_row.addWidget(self.translate_page_btn)
+        # 预翻译下拉按钮
+        self.prefetch_btn = QToolButton()
+        self.prefetch_btn.setText("预翻译 ▼")
+        self.prefetch_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        prefetch_menu = QMenu(self)
+        for n in (1, 3, 5):
+            action = prefetch_menu.addAction(f"下 {n} 页")
+            action.setData(n)
+            action.triggered.connect(lambda checked, count=n: self._manual_prefetch(count))
+        self.prefetch_btn.setMenu(prefetch_menu)
+        tool_row.addWidget(self.prefetch_btn)
         # 清除缓存按钮（小字，非主要操作）
         self.clear_cache_btn = QPushButton("清除缓存")
         self.clear_cache_btn.setStyleSheet("QPushButton { color: #888; font-size: 11px; padding: 2px 8px; }")
@@ -856,6 +878,8 @@ class MainWindow(QMainWindow):
         """
         # 清理上一次的压缩包临时目录（如有）
         self._cleanup_archive_temp()
+        # 清空预翻译队列（切换来源时）
+        self.prefetch_manager.clear()
 
         # 保存旧来源的阅读位置（F7：切换前记录；用 _source_path 作键，对压缩包稳定）
         if self._source_path and self.current_file_index >= 0:
@@ -1006,6 +1030,7 @@ class MainWindow(QMainWindow):
             self._update_page_info()   # 刷新页码（_current_image_path 已正确设置）
             self._set_translating(False)
             self._prefetch_adjacent()  # 仍然预加载相邻页
+            self._trigger_auto_prefetch()
             return
         
         # === 第二步：未命中缓存，异步加载 ===
@@ -1036,7 +1061,8 @@ class MainWindow(QMainWindow):
                 self.status_bar.showMessage(f"已加载: {os.path.basename(image_path)}")
                 self._update_page_info()   # 刷新页码指示器
                 self._prefetch_adjacent()
-    
+                self._trigger_auto_prefetch()
+
     def _on_image_load_error(self, image_path, error_msg):
         """异步图片解码失败回调"""
         self.pending_loads.pop(image_path, None)
@@ -1139,6 +1165,11 @@ class MainWindow(QMainWindow):
         if self.canvas._btn_prev is not None:
             self.canvas._btn_prev.setEnabled(current > 0)
             self.canvas._btn_next.setEnabled(current < count - 1)
+        # 预翻译按钮：最后一页或只有 1 页时禁用
+        if hasattr(self, 'prefetch_btn'):
+            total = self.file_list.count()
+            current = self.file_list.currentRow()
+            self.prefetch_btn.setEnabled(total > 1 and current < total - 1)
     
     # ===================== 设置对话框 =====================
     
@@ -1255,6 +1286,13 @@ class MainWindow(QMainWindow):
         self._switch_tab("trans")
         
         # 填充总结区
+        self._fill_summary(summary_dict)
+
+        self._set_translating(False)
+        self.status_bar.showMessage("翻译完成", 5000)
+
+    def _fill_summary(self, summary_dict):
+        """填充总结区（剧情 + 翻译备注）"""
         if summary_dict and (summary_dict.get("plot") or summary_dict.get("notes")):
             plot = summary_dict.get("plot", "").strip()
             notes = summary_dict.get("notes", "").strip()
@@ -1268,18 +1306,13 @@ class MainWindow(QMainWindow):
                     html_parts.append("<br><br>")
                 html_parts.append("📝 翻译备注")
                 html_parts.append("<br><br>")
-                # 正则处理换行：LLM 返回的 \n 在 HTML 中被忽略，统一转为 <br>
-                # 同时处理 " - " 模式，确保列表项各自独占一行
                 notes_html = notes.replace('\n', '<br>')
                 notes_html = re.sub(r'\s+-\s+', '<br>- ', notes_html)
                 html_parts.append(notes_html)
             self.summary_text_edit.setHtml("".join(html_parts))
         else:
             self.summary_text_edit.setPlainText("本页暂未生成总结")
-        
-        self._set_translating(False)
-        self.status_bar.showMessage("翻译完成", 5000)
-    
+
     def on_translation_error(self, error_msg):
         """
         翻译错误回调函数
@@ -1341,6 +1374,78 @@ class MainWindow(QMainWindow):
             # 清理残留的临时文件
             self._clean_temp_files()
     
+    def _manual_prefetch(self, count: int):
+        """手动预翻译：将后续 count 页加入预翻译队列"""
+        total = self.file_list.count()
+        start = self.current_file_index + 1
+        end = min(start + count, total)
+        if start >= total:
+            return
+        paths = []
+        for i in range(start, end):
+            item = self.file_list.item(i)
+            if item:
+                paths.append(os.path.join(self.current_folder, item.text()))
+        if paths:
+            self.prefetch_manager.enqueue(paths)
+            self.status_bar.showMessage(f"📦 预翻译: 已加入 {len(paths)} 页")
+
+    def _trigger_auto_prefetch(self):
+        """自动预翻译触发：读取配置，如开启则调用 resync"""
+        config = load_config()
+        if not config.get("prefetch_enabled", False):
+            return
+        total = self.file_list.count()
+        if self.current_file_index < 0 or total == 0:
+            return
+        # 构建当前页面路径有序列表
+        page_paths = []
+        for i in range(total):
+            item = self.file_list.item(i)
+            if item:
+                page_paths.append(os.path.join(self.current_folder, item.text()))
+        prefetch_count = config.get("prefetch_count", 3)
+        self.prefetch_manager.resync(self.current_file_index, page_paths, prefetch_count)
+
+    def _on_prefetch_progress(self, completed: int, total: int):
+        """预翻译进度更新 → 状态栏"""
+        self.status_bar.showMessage(f"📦 预翻译: {completed}/{total} 页已完成")
+
+    def _on_prefetch_page_completed(self, image_path: str):
+        """预翻译单页完成 → 如果当前正显示该页，刷新 UI 面板"""
+        if not hasattr(self.canvas, '_current_image_path'):
+            return
+        if image_path != self.canvas._current_image_path:
+            return
+
+        # 如果主翻译正在处理同一页，让主翻译的回调来刷新 UI，避免重复刷新
+        if self.worker is not None and self.worker.isRunning():
+            return
+
+        # 从缓存读取结果并刷新右侧面板
+        try:
+            mtime = os.path.getmtime(image_path)
+            cached = self.translation_cache.get(image_path, mtime)
+            if cached:
+                self.origin_text = cached.get("original", "")
+                self.translated_text = cached.get("translated", "")
+                self._switch_tab("trans")
+                # 填充总结区
+                summary_dict = cached.get("summary", {})
+                if summary_dict and (summary_dict.get("plot") or summary_dict.get("notes")):
+                    self._fill_summary(summary_dict)
+                else:
+                    self.summary_text_edit.setPlainText("本页暂未生成总结")
+                self.status_bar.showMessage("预翻译缓存命中，已刷新", 3000)
+            else:
+                _logger.warning(f"预翻译页面完成但缓存未命中: {image_path}")
+        except Exception as e:
+            _logger.warning(f"预翻译页面完成刷新 UI 失败: {e}")
+
+    def _on_prefetch_all_completed(self):
+        """预翻译全部完成 → 状态栏提示，3 秒后消失"""
+        self.status_bar.showMessage("📦 预翻译完成，已缓存", 3000)
+
     def translate_current_page(self):
         """翻译当前画布中显示的整张图片"""
         # 重入保护：先清理上一个 worker，防止新旧 worker 竞争
@@ -1351,6 +1456,8 @@ class MainWindow(QMainWindow):
             return
         
         image_path = self.canvas._current_image_path
+        # 从预翻译队列中提升当前页（如正在预翻译则不终止）
+        self.prefetch_manager.promote(image_path)
         self._translating_image_path = image_path  # 记录路径用于缓存写回
         self._set_translating(True)
         self.origin_text = ""
@@ -1364,8 +1471,11 @@ class MainWindow(QMainWindow):
         self.worker.start()
     
     def keyPressEvent(self, event):
-        """键盘快捷键：左右方向键翻页、F5 翻译当前页（画布未聚焦时也可用）"""
-        if event.key() == Qt.Key.Key_F5:
+        """键盘快捷键：左右方向键翻页、F5 翻译当前页、Ctrl+Shift+F5 预翻译下 3 页"""
+        modifiers = event.modifiers()
+        if event.key() == Qt.Key.Key_F5 and modifiers == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
+            self._manual_prefetch(3)
+        elif event.key() == Qt.Key.Key_F5:
             self.translate_current_page()
         elif event.key() == Qt.Key.Key_Left:
             self._nav_prev_page()
@@ -1406,6 +1516,8 @@ class MainWindow(QMainWindow):
         if self._source_path and self.current_file_index >= 0:
             save_last_position(self._source_path, self.current_file_index)
 
+        # 终止预翻译 worker
+        self.prefetch_manager.clear()
         # 终止翻译 worker
         if self.worker and self.worker.isRunning():
             self.worker.terminate()
