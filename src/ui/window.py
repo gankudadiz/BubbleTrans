@@ -461,10 +461,11 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(splitter)
         
-        # --- 1. 左侧面板（搜索框 + 文件列表，固定宽度200px）---
+        # --- 1. 左侧面板（搜索框 + 文件列表，默认宽度200px，可拖拽调整）---
         # 容器 widget：包裹搜索框和文件列表，作为整体加入 QSplitter
         left_panel = QWidget()
-        left_panel.setFixedWidth(200)
+        left_panel.setMinimumWidth(120)    # 最小宽度，防止搜索框溢出
+        left_panel.resize(200, left_panel.height())  # 初始宽度
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(4)
@@ -502,14 +503,16 @@ class MainWindow(QMainWindow):
         right_panel.setFixedWidth(300)
         right_layout = QVBoxLayout(right_panel)
         
-        # --- 按钮行 ---
-        tool_row = QHBoxLayout()
+        # --- 按钮行（两行：主操作 + 辅助信息）---
+        # 第一行：主操作按钮，有充足空间不截断
+        tool_row1 = QHBoxLayout()
+        tool_row1.setSpacing(6)
         self.translate_page_btn = QPushButton("翻译当前页")
         self.translate_page_btn.clicked.connect(self.translate_current_page)
-        tool_row.addWidget(self.translate_page_btn)
+        tool_row1.addWidget(self.translate_page_btn)
         # 预翻译下拉按钮
         self.prefetch_btn = QToolButton()
-        self.prefetch_btn.setText("预翻译 ▼")
+        self.prefetch_btn.setText("预翻译")  # QToolButton 原生下拉箭头自动显示
         self.prefetch_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         prefetch_menu = QMenu(self)
         for n in (1, 3, 5):
@@ -517,17 +520,29 @@ class MainWindow(QMainWindow):
             action.setData(n)
             action.triggered.connect(lambda checked, count=n: self._manual_prefetch(count))
         self.prefetch_btn.setMenu(prefetch_menu)
-        tool_row.addWidget(self.prefetch_btn)
-        # 清除缓存按钮（小字，非主要操作）
-        self.clear_cache_btn = QPushButton("清除缓存")
-        self.clear_cache_btn.setStyleSheet("QPushButton { color: #888; font-size: 11px; padding: 2px 8px; }")
-        self.clear_cache_btn.clicked.connect(self._clear_translation_cache)
-        tool_row.addWidget(self.clear_cache_btn)
-        tool_row.addStretch()
-        # 语言标签（从 llm_engine.target_lang 读取）
+        tool_row1.addWidget(self.prefetch_btn)
+        tool_row1.addStretch()
+        right_layout.addLayout(tool_row1)
+        # 第二行：次要操作 + 语言信息
+        tool_row2 = QHBoxLayout()
+        tool_row2.setSpacing(6)
+        # 清除缓存下拉按钮
+        self.clear_cache_btn = QToolButton()
+        self.clear_cache_btn.setText("清除缓存")
+        self.clear_cache_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.clear_cache_btn.setStyleSheet("QToolButton { color: #888; font-size: 11px; padding: 2px 8px; }")
+        clear_menu = QMenu(self)
+        clear_current_action = clear_menu.addAction("清除当前页缓存")
+        clear_current_action.triggered.connect(self._clear_current_page_cache)
+        clear_all_action = clear_menu.addAction("清除全部缓存")
+        clear_all_action.triggered.connect(self._clear_translation_cache)
+        self.clear_cache_btn.setMenu(clear_menu)
+        tool_row2.addWidget(self.clear_cache_btn)
+        tool_row2.addStretch()
         self.lang_label = QLabel(f"语言: {llm_engine.target_lang}")
-        tool_row.addWidget(self.lang_label)
-        right_layout.addLayout(tool_row)
+        self.lang_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        tool_row2.addWidget(self.lang_label)
+        right_layout.addLayout(tool_row2)
         
         # --- 分段切换按钮："原文" / "译文" ---
         seg_container = QWidget()
@@ -537,7 +552,7 @@ class MainWindow(QMainWindow):
                 background-color: #1e1e1e;
                 border: 1px solid #444;
                 border-radius: 4px;
-                padding: 2px;
+                padding: 1px;
             }
         """)
         seg_layout = QHBoxLayout(seg_container)
@@ -555,9 +570,9 @@ class MainWindow(QMainWindow):
                 background-color: transparent;
                 color: #999999;
                 border: 1px solid transparent;
-                border-radius: 4px;
-                padding: 6px 16px;
-                font-size: 13px;
+                border-radius: 3px;
+                padding: 4px 12px;
+                font-size: 12px;
             }
             QPushButton:hover {
                 background-color: #2b2b2b;
@@ -767,6 +782,23 @@ class MainWindow(QMainWindow):
         self._spinner_dots = (self._spinner_dots + 1) % 4
         dots = "." * self._spinner_dots
         self.translate_page_btn.setText(f"翻译中{dots}")
+
+    def _clear_current_page_cache(self):
+        """清除当前页的翻译缓存（无确认，即时清除）"""
+        if not hasattr(self.canvas, '_current_image_path') or not self.canvas._current_image_path:
+            self.status_bar.showMessage("当前无图片，无法清除缓存", 3000)
+            return
+        image_path = self.canvas._current_image_path
+        removed = self.translation_cache.clear_image(image_path)
+        if removed:
+            self.status_bar.showMessage(f"已清除当前页缓存", 3000)
+            # 清除右侧面板显示的旧翻译结果
+            self.origin_text = ""
+            self.translated_text = ""
+            self.shared_text_edit.clear()
+            self.summary_text_edit.clear()
+        else:
+            self.status_bar.showMessage("当前页无缓存", 3000)
 
     def _clear_translation_cache(self):
         """清除全部翻译缓存（带确认对话框）"""
@@ -1162,7 +1194,7 @@ class MainWindow(QMainWindow):
         if current >= 0:
             self.canvas.update_page_indicator(current + 1, count)
         # 首页禁用前翻，末页禁用后翻（仅当按钮已初始化时）
-        if self.canvas._btn_prev is not None:
+        if self.canvas._btn_prev is not None and self.canvas._btn_next is not None:
             self.canvas._btn_prev.setEnabled(current > 0)
             self.canvas._btn_next.setEnabled(current < count - 1)
         # 预翻译按钮：最后一页或只有 1 页时禁用
@@ -1375,7 +1407,7 @@ class MainWindow(QMainWindow):
             self._clean_temp_files()
     
     def _manual_prefetch(self, count: int):
-        """手动预翻译：将后续 count 页加入预翻译队列"""
+        """手动预翻译：将后续 count 页加入预翻译队列（不含当前页）"""
         total = self.file_list.count()
         start = self.current_file_index + 1
         end = min(start + count, total)
@@ -1389,6 +1421,8 @@ class MainWindow(QMainWindow):
         if paths:
             self.prefetch_manager.enqueue(paths)
             self.status_bar.showMessage(f"📦 预翻译: 已加入 {len(paths)} 页")
+            # 按钮进入执行态，由 _on_prefetch_all_completed 恢复
+            self.prefetch_btn.setText("预翻译中…")
 
     def _trigger_auto_prefetch(self):
         """自动预翻译触发：读取配置，如开启则调用 resync"""
@@ -1443,8 +1477,9 @@ class MainWindow(QMainWindow):
             _logger.warning(f"预翻译页面完成刷新 UI 失败: {e}")
 
     def _on_prefetch_all_completed(self):
-        """预翻译全部完成 → 状态栏提示，3 秒后消失"""
+        """预翻译全部完成 → 状态栏提示 + 按钮恢复"""
         self.status_bar.showMessage("📦 预翻译完成，已缓存", 3000)
+        self.prefetch_btn.setText("预翻译")
 
     def translate_current_page(self):
         """翻译当前画布中显示的整张图片"""

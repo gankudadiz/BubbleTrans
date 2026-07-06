@@ -34,6 +34,8 @@ BubbleTrans - 大语言模型翻译引擎模块
 import os               # 操作系统功能（环境变量等）
 import base64           # Base64编码解码（用于图片转码）
 import re               # 正则表达式（用于解析LLM返回结果）
+from typing import Optional  # 类型标注
+from utils.cache import TranslationCache  # type: ignore[import-untyped]
 from io import BytesIO  # 内存中的二进制流（用于图片缩放）
 
 # ============================================================================
@@ -109,8 +111,8 @@ class LLMEngine:
         self.client = None                                      # OpenAI客户端实例
         self.active_profile = "默认"                            # 当前激活的配置档案
         
-        # 翻译缓存（由 MainWindow 注入，类型: Optional[TranslationCache]）
-        self.cache = None  # type: ignore
+        # 翻译缓存（由 MainWindow 注入）
+        self.cache: Optional[TranslationCache] = None
         self.last_from_cache = False
 
         # 从配置文件加载设置
