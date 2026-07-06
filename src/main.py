@@ -155,12 +155,9 @@ def main():
     # 这些参数会被Qt框架处理
     app = QApplication(sys.argv)
 
-    # 跟随系统主题自动选择 Material Design 主题
-    # Windows: 设置 → 个性化 → 颜色 → 选择模式
-    # macOS: 系统设置 → 外观
-    scheme = app.styleHints().colorScheme()
-    theme = 'dark_teal.xml' if scheme == Qt.ColorScheme.Dark else 'light_teal.xml'
-    _logger.info(f"系统主题: {'暗色' if scheme == Qt.ColorScheme.Dark else '亮色'} → 使用 {theme}")
+    # 统一使用暗色主题，避免亮色系统下与组件硬编码暗色样式混搭
+    theme = 'dark_teal.xml'
+    _logger.info(f"使用暗色主题: {theme}")
 
     apply_stylesheet(app, theme=theme, extra={
         'font_family': 'Microsoft YaHei',
