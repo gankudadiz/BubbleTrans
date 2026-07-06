@@ -1,4 +1,4 @@
-# BubbleTrans v2.1
+# BubbleTrans v2.4
 
 漫画气泡翻译器，基于多模态大模型。识别 + 翻译 + 剧情总结，一次搞定。
 
@@ -8,10 +8,10 @@ A comic speech-bubble translator powered by multimodal LLMs — OCR, translation
 
 ## 截图 / Screenshot
 
-![Main UI](file/翻译主界面_v2.1.png)
+![Main UI](file/翻译主界面_v2.4.png)
 
-*翻译主界面：左侧文件列表 · 中间漫画画布 · 右侧分段切换译文 + 当页AI总结*
-*Main UI: file list (left) · canvas (center) · segmented translation + AI summary (right)*
+*翻译主界面：左侧文件列表 · 中间漫画画布 · 右侧分段切换译文 + 当页AI总结 · Material Design 深色主题*
+*Main UI: file list (left) · canvas (center) · segmented translation + AI summary (right) · Material Design dark theme*
 
 ---
 
@@ -75,11 +75,12 @@ A comic speech-bubble translator powered by multimodal LLMs — OCR, translation
 PyQt6>=6.4.0
 openai>=1.0.0
 Pillow>=9.0.0
+qt-material>=2.14
 ```
 
-仅 3 个包。v1.0 时代的 PaddleOCR / paddlepaddle 已完全移除。
+仅 4 个包。v1.0 时代的 PaddleOCR / paddlepaddle 已完全移除。
 
-Only 3 packages. PaddleOCR / paddlepaddle from v1.0 are completely removed.
+Only 4 packages. PaddleOCR / paddlepaddle from v1.0 are completely removed.
 
 ---
 

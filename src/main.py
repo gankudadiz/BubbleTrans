@@ -126,7 +126,9 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 # MainWindow: 自定义的主窗口类（在ui/window.py中定义）
 # ============================================================================
 from PyQt6.QtWidgets import QApplication
+from PyQt6.QtCore import Qt
 from ui.window import MainWindow
+from qt_material import apply_stylesheet
 
 
 def main():
@@ -152,6 +154,18 @@ def main():
     # python main.py --fullscreen
     # 这些参数会被Qt框架处理
     app = QApplication(sys.argv)
+
+    # 跟随系统主题自动选择 Material Design 主题
+    # Windows: 设置 → 个性化 → 颜色 → 选择模式
+    # macOS: 系统设置 → 外观
+    scheme = app.styleHints().colorScheme()
+    theme = 'dark_teal.xml' if scheme == Qt.ColorScheme.Dark else 'light_teal.xml'
+    _logger.info(f"系统主题: {'暗色' if scheme == Qt.ColorScheme.Dark else '亮色'} → 使用 {theme}")
+
+    apply_stylesheet(app, theme=theme, extra={
+        'font_family': 'Microsoft YaHei',
+        'density_scale': '-1',
+    })
     
     # 创建主窗口实例
     # MainWindow 类定义了应用程序的主要UI界面

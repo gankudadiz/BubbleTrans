@@ -5,7 +5,8 @@ import importlib.util
 REQUIRED_PACKAGES = {
     "PyQt6": "PyQt6",
     "openai": "openai",
-    "PIL": "Pillow"
+    "PIL": "Pillow",
+    "qt_material": "qt-material"
 }
 
 def check_package(package_name, install_name):
