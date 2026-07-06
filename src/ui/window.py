@@ -813,6 +813,11 @@ class MainWindow(QMainWindow):
         )
         if reply == QMessageBox.StandardButton.Yes:
             self.translation_cache.clear()
+            # 清空右侧面板显示的旧翻译结果
+            self.origin_text = ""
+            self.translated_text = ""
+            self.shared_text_edit.clear()
+            self.summary_text_edit.clear()
             self.status_bar.showMessage(f"已清除 {count} 条翻译缓存", 5000)
 
     # ===================== 槽函数 =====================
