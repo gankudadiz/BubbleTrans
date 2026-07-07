@@ -127,6 +127,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 # ============================================================================
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QIcon
 from ui.window import MainWindow
 from qt_material import apply_stylesheet
 
@@ -148,12 +149,32 @@ def main():
     _logger.info("BubbleTrans 启动")
     _logger.info(f"Python: {sys.version}")
     _logger.info(f"工作目录: {os.getcwd()}")
+
+    # Windows 任务栏图标修正：
+    # 通过 pythonw.exe 启动时，Windows 会默认将任务栏图标显示为 Python 标志。
+    # 调用 SetCurrentProcessExplicitAppUserModelID 告诉 Windows 这是一个独立应用，
+    # 配合 app.setWindowIcon() 后任务栏将显示自定义图标而非 Python 图标。
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("BubbleTrans")
+        except Exception:
+            pass
     
     # 创建Qt应用程序实例
     # sys.argv 包含命令行参数，例如：
     # python main.py --fullscreen
     # 这些参数会被Qt框架处理
     app = QApplication(sys.argv)
+
+    # 设置应用程序图标（任务栏 + 标题栏）
+    icon_path = Path(__file__).resolve().parent.parent / "file" / "icon.ico"
+    if icon_path.exists():
+        icon = QIcon(str(icon_path))
+        app.setWindowIcon(icon)
+        _logger.info(f"图标加载成功: {icon_path}")
+    else:
+        _logger.warning(f"图标文件不存在: {icon_path}")
 
     # 统一使用暗色主题，避免亮色系统下与组件硬编码暗色样式混搭
     theme = 'dark_teal.xml'
