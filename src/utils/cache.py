@@ -14,6 +14,7 @@ BubbleTrans - 翻译缓存管理器
 """
 
 import os
+import sys
 import json
 import hashlib
 import logging
@@ -47,10 +48,14 @@ class TranslationCache:
                        默认取项目根目录下的 translation_cache.json
         """
         if cache_path is None:
-            # 基于本文件位置推导项目根目录
-            # src/utils/cache.py → src/utils → src → 项目根目录
-            _dir = os.path.dirname(os.path.abspath(__file__))
-            _project_root = os.path.dirname(os.path.dirname(_dir))
+            # 缓存目录：优先使用 exe/py 所在目录（与 config.json 同级）
+            # PyInstaller 打包后 __file__ 指向临时目录，需用 sys.executable 修正
+            if getattr(sys, 'frozen', False):
+                _project_root = os.path.dirname(os.path.abspath(sys.executable))
+            else:
+                # src/utils/cache.py → src/utils → src → 项目根目录
+                _dir = os.path.dirname(os.path.abspath(__file__))
+                _project_root = os.path.dirname(os.path.dirname(_dir))
             cache_path = os.path.join(_project_root, CACHE_FILENAME)
 
         self.cache_path = cache_path
