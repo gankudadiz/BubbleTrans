@@ -156,7 +156,7 @@ class ImageCanvas(QGraphicsView):
         self.pan_start = QPoint()       # 平移开始时的鼠标位置
         
         # ===== 导航覆盖层 =====
-        # 按钮仅做键盘方向键翻页，不显示 UI 控件
+        # 按钮和页码指示器已移除，导航仅通过键盘方向键进行
         self._btn_prev = None
         self._btn_next = None
         self._lbl_page = None
@@ -165,6 +165,11 @@ class ImageCanvas(QGraphicsView):
         
         # 接受键盘焦点，以支持左右方向键翻页
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    
+    @property
+    def current_image_path(self):
+        """当前画布中显示的图片路径，无图片时返回 None"""
+        return getattr(self, '_current_image_path', None)
     
     def load_image(self, image_path, pixmap=None):
         """
@@ -243,84 +248,6 @@ class ImageCanvas(QGraphicsView):
             self._lbl_page.hide()
     
     # ===================== 导航覆盖层 =====================
-    
-    def _setup_nav_overlay(self):
-        """创建半透明导航按钮和页码指示器（浮在画布上方）"""
-        viewport = self.viewport()
-        
-        # 设置画布的鼠标追踪（用于 hover 显示导航按钮）
-        self.setMouseTracking(True)
-        
-        # --- 前翻按钮 ---
-        self._btn_prev = QPushButton("<", viewport)
-        self._btn_prev.setFixedSize(44, 44)
-        self._btn_prev.setCursor(Qt.CursorShape.ArrowCursor)
-        self._btn_prev.clicked.connect(self.nav_prev.emit)
-        
-        # --- 后翻按钮 ---
-        self._btn_next = QPushButton(">", viewport)
-        self._btn_next.setFixedSize(44, 44)
-        self._btn_next.setCursor(Qt.CursorShape.ArrowCursor)
-        self._btn_next.clicked.connect(self.nav_next.emit)
-        
-        # --- 页码指示器 ---
-        self._lbl_page = QLabel("", viewport)
-        self._lbl_page.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
-        # --- 统一样式 ---
-        self._apply_nav_styles()
-        
-        # --- 初始隐藏，hover 时浮现 ---
-        self._nav_visible = False
-        self._btn_prev.hide()
-        self._btn_next.hide()
-        self._lbl_page.hide()
-        
-        # --- 延时隐藏定时器 ---
-        self._nav_hide_timer = QTimer(self)
-        self._nav_hide_timer.setSingleShot(True)
-        self._nav_hide_timer.timeout.connect(self._hide_nav_overlay)
-        
-        # --- 位置更新 ---
-        self._reposition_nav_overlay()
-    
-    def _apply_nav_styles(self):
-        """为导航按钮和页码指示器应用统一样式表（避免 rgba 确保兼容性）"""
-        btn_style = """
-        QPushButton {
-            background-color: #1e1e1e;
-            color: #cccccc;
-            border: 1px solid #555555;
-            border-radius: 22px;
-            font-size: 18px;
-            font-weight: bold;
-        }
-        QPushButton:hover {
-            background-color: #3a3a3a;
-            color: #ffffff;
-            border: 1px solid #888888;
-        }
-        QPushButton:pressed {
-            background-color: #505050;
-        }
-        QPushButton:disabled {
-            background-color: #1a1a1a;
-            color: #444444;
-            border: 1px solid #333333;
-        }
-        """
-        lbl_style = """
-        QLabel {
-            background-color: #1e1e1e;
-            color: #cccccc;
-            border-radius: 10px;
-            padding: 4px 12px;
-            font-size: 13px;
-        }
-        """
-        self._btn_prev.setStyleSheet(btn_style)
-        self._btn_next.setStyleSheet(btn_style)
-        self._lbl_page.setStyleSheet(lbl_style)
     
     def _reposition_nav_overlay(self):
         """根据视口大小重新定位导航按钮和页码指示器"""

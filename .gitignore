@@ -36,3 +36,6 @@ temp/
 
 articles/
 logs/
+
+# OpenCode session state
+.slim/deepwork/

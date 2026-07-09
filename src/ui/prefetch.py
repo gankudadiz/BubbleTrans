@@ -179,10 +179,10 @@ class PrefetchManager(QObject):
         """
         处理队列：启动新的 worker 直到达到最大并发数
 
-        延迟导入 TranslationWorker 以避免循环依赖（window.py 可能导入本模块）。
+        延迟导入 TranslationWorker 以降低启动开销（PDR-01 后已无循环依赖）。
         """
         # 延迟导入避免循环依赖
-        from ui.window import TranslationWorker
+        from engine.workers import TranslationWorker
 
         while len(self._active) < self._max_concurrent and self._queue:
             path = self._queue.popleft()

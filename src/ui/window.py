@@ -11,7 +11,7 @@ BubbleTrans - Scrappy Comic Translator 主窗口模块
 
 核心组件：
 - MainWindow: 主窗口类，管理整个应用程序的UI
-- TranslationWorker: 后台线程，负责LLM翻译任务
+- TranslationWorker: 后台线程（定义在 engine/workers.py）
 - CropConfirmDialog: 确认框选区域的对话框
 """
 
@@ -70,13 +70,9 @@ from PyQt6.QtCore import (
 import os               # 文件路径操作
 import re               # 正则表达式
 import shutil           # 文件操作（删除目录树）
-import tempfile         # 临时文件目录
 import zipfile          # ZIP 格式校验
-import uuid             # 唯一标识，用于生成不重复的临时文件名
 import time             # 耗时统计
 import logging          # 日志记录
-from collections import OrderedDict  # LRU缓存
-
 _logger = logging.getLogger("BubbleTrans")
 
 # ============================================================================
@@ -94,89 +90,11 @@ from utils.cache import TranslationCache
 import utils.archive as archive  # 压缩包支持
 from utils.config import load_config, save_config, add_recent_folder, save_last_position, get_last_position
 from ui.prefetch import PrefetchManager
+from engine.workers import TranslationWorker, ImageLoadWorker
+from ui.image_cache import ImageCacheManager
+from engine.translation_controller import TranslationController
+from ui.file_browser import FileBrowser
 
-
-# ============================================================================
-# TranslationWorker 类 - 翻译工作线程
-# ============================================================================
-# 继承自QThread，用于在后台执行耗时的LLM翻译任务
-# 
-# 为什么需要线程？
-# - LLM翻译是耗时操作，可能需要几秒钟
-# - 如果在主线程执行，会导致GUI界面卡死
-# - 使用QThread可以在后台执行这些任务，不阻塞UI响应
-#
-# 信号说明：
-# - finished: 任务完成时发射，携带原文、译文和总结字典（str, str, dict）
-# - error:    发生错误时发射，携带错误信息
-# - status:   状态更新时发射，用于显示当前进度
-# ============================================================================
-class TranslationWorker(QThread):
-    # 定义信号，pyqtSignal用于跨线程通信
-    finished = pyqtSignal(str, str, dict)  # origin_text, translated_text, summary_dict
-    error = pyqtSignal(str)                # 错误信息
-    status = pyqtSignal(str)               # 状态信息（已弃用，保留兼容）
-    stage_changed = pyqtSignal(str)        # 阶段变化（编码/等待/解析/完成）
-    
-    def __init__(self, image_path):
-        """
-        初始化翻译工作线程
-        
-        参数:
-            image_path: 要翻译的图片路径
-        """
-        super().__init__()
-        self.image_path = image_path
-    
-    def run(self):
-        """
-        线程主函数 - 直接使用LLM翻译图片
-        
-        使用LLM的视觉能力直接识别并翻译图片中的文字
-        分阶段发射进度信号供 UI 层更新状态栏
-        """
-        try:
-            self.stage_changed.emit("正在翻译…")
-            origin_text, translated_text, summary_dict = llm_engine.translate_image(self.image_path)
-            self.stage_changed.emit("正在解析…")
-            self.finished.emit(origin_text, translated_text, summary_dict)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-# ============================================================================
-# ImageLoadWorker 类 - 图片异步解码线程
-# ============================================================================
-# 继承自QThread，在后台线程中解码QPixmap，避免主线程卡顿
-#
-# 为什么需要异步解码？
-# - 漫画扫描页通常 4000×6000 像素，QPixmap 解码需 200-800ms
-# - 在主线程解码会导致整个窗口冻结
-# - 后台解码 + 占位文字 = 流畅体验
-#
-# 信号说明：
-# - loaded: 解码完成时发射 (image_path, QPixmap)
-# - error:  解码失败时发射 (image_path, error_msg)
-# ============================================================================
-class ImageLoadWorker(QThread):
-    """后台线程：异步解码图片文件为 QPixmap"""
-    loaded = pyqtSignal(str, QPixmap)  # image_path, pixmap
-    error = pyqtSignal(str, str)       # image_path, error_msg
-    
-    def __init__(self, image_path):
-        super().__init__()
-        self.image_path = image_path
-    
-    def run(self):
-        """在后台线程中执行 QPixmap 解码"""
-        try:
-            pixmap = QPixmap(self.image_path)
-            if pixmap.isNull():
-                self.error.emit(self.image_path, f"无法解码: {self.image_path}")
-            else:
-                self.loaded.emit(self.image_path, pixmap)
-        except Exception as e:
-            self.error.emit(self.image_path, str(e))
 
 
 # ============================================================================
@@ -358,29 +276,30 @@ class MainWindow(QMainWindow):
         self.resize(1200, 800)  # 设置窗口大小
         
         # 实例变量初始化
-        self.current_folder = ""      # 当前打开的文件夹路径
-        self._source_path = ""        # 原始来源路径（文件夹或压缩包路径，用于记录最近打开）
-        self.worker = None            # 翻译工作线程实例
-        self._temp_files = []         # 待清理的临时文件路径列表
-        self._archive_temp_dir = ""   # 压缩包解压的临时目录（非空表示当前来源是压缩包）
         
         # 右侧面板状态
         self.origin_text = ""         # 当前原文
         self.translated_text = ""     # 当前译文
         self.current_tab = "trans"    # 当前选中的 tab（默认译文）
-        self._translating_image_path = ""  # 正在翻译的图片路径（用于缓存判断）
         
         # === 图片缓存与异步加载 ===
-        # LRU缓存：最多缓存10张已解码的 QPixmap，翻回同一页秒开
-        self.pixmap_cache = OrderedDict()   # path -> QPixmap
-        self.pending_loads = {}             # path -> ImageLoadWorker（防止重复加载）
         self.current_file_index = -1        # 当前显示的文件在列表中的索引
-        self.MAX_CACHE_SIZE = 10            # 最大缓存页数
-        self.PREFETCH_RANGE = 2             # 相邻预加载范围（前后各2页）
+        # 图片缓存管理器（LRU + 异步解码 + 预加载）
+        self.image_cache = ImageCacheManager(max_cache_size=10, prefetch_range=2, parent=self)
+        self.image_cache.image_loaded.connect(self._on_image_cached)
+        self.image_cache.image_error.connect(self._on_image_cache_error)
         
         # 初始化翻译缓存（注入到全局 llm_engine 实例）
         self.translation_cache = TranslationCache()
         llm_engine.cache = self.translation_cache
+
+        # 翻译编排控制器
+        self.translation_controller = TranslationController(self.translation_cache, parent=self)
+        self.translation_controller.stage_changed.connect(self._on_translation_stage)
+        self.translation_controller.translating_changed.connect(self._set_translating)
+        self.translation_controller.translation_finished.connect(self._on_translation_finished)
+        self.translation_controller.translation_error.connect(self._on_translation_error)
+        self.translation_controller.translation_started.connect(self._on_translation_started)
 
         # === 预翻译管理器 ===
         _cfg = load_config()
@@ -391,6 +310,12 @@ class MainWindow(QMainWindow):
         self.prefetch_manager.progress_changed.connect(self._on_prefetch_progress)
         self.prefetch_manager.page_completed.connect(self._on_prefetch_page_completed)
         self.prefetch_manager.all_completed.connect(self._on_prefetch_all_completed)
+
+        # 文件浏览器（替代原来的左侧面板）
+        self.file_browser = FileBrowser()
+        self.file_browser.file_selected.connect(self.load_image)
+        self.file_browser.source_changed.connect(self._on_source_changed)
+        self.file_browser.file_list_loaded.connect(self._on_file_list_loaded)
 
         # === 翻译进度动画 ===
         # 按钮加载动画：3 点省略号循环
@@ -407,7 +332,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(500, self._maybe_show_shortcut_overlay)
 
         # 自动恢复上次打开的文件（延迟以确保窗口已初始化）
-        QTimer.singleShot(100, self._auto_restore_last)
+        QTimer.singleShot(100, self.file_browser.restore_last)
     
     def init_ui(self):
         """
@@ -421,25 +346,6 @@ class MainWindow(QMainWindow):
         # ===== 工具栏 =====
         toolbar = QToolBar()
         self.addToolBar(toolbar)
-        
-        # "打开文件夹"按钮（带最近打开路径下拉菜单）
-        self._open_btn = QToolButton()
-        self._open_btn.setText("Open Folder")
-        self._open_btn.setToolTip("打开文件夹 / 点击下拉箭头查看最近打开")
-        self._open_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
-        self._open_btn.clicked.connect(self.open_folder)  # 按钮主体点击 → 弹出文件夹选择对话框
-        self._recent_menu = QMenu(self)
-        self._open_btn.setMenu(self._recent_menu)  # 下拉箭头 → 展开最近路径菜单
-        # 首次构建菜单
-        self._refresh_recent_menu()
-        # 菜单即将弹出时刷新（确保始终显示最新列表）
-        self._recent_menu.aboutToShow.connect(self._refresh_recent_menu)
-        toolbar.addWidget(self._open_btn)
-
-        # "打开压缩包"按钮（新增：支持 .cbz / .zip 漫画压缩包）
-        open_archive_action = QAction("Open Archive", self)
-        open_archive_action.triggered.connect(self.open_archive)
-        toolbar.addAction(open_archive_action)
 
         # "快捷键"说明按钮
         shortcuts_action = QAction("Shortcuts", self)
@@ -451,45 +357,17 @@ class MainWindow(QMainWindow):
         settings_action.triggered.connect(self.open_settings)
         settings_action.setToolTip("设置 (快捷键、API 配置)")
         toolbar.addAction(settings_action)
-        
+
         # ===== 主布局 =====
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)  # 水平布局
-        
-        # 使用分割器，可以拖动调整各区域大小
+        main_layout = QHBoxLayout(central_widget)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(splitter)
-        
-        # --- 1. 左侧面板（搜索框 + 文件列表，默认宽度200px，可拖拽调整）---
-        # 容器 widget：包裹搜索框和文件列表，作为整体加入 QSplitter
-        left_panel = QWidget()
-        left_panel.setMinimumWidth(120)    # 最小宽度，防止搜索框溢出
-        left_panel.resize(200, left_panel.height())  # 初始宽度
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(4)
 
-        # 搜索框（顶部）
-        self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("🔍 搜索文件名…")
-        self.search_box.setClearButtonEnabled(True)  # 右侧 X 按钮一键清空
-        self.search_box.textChanged.connect(self.filter_file_list)  # 实时过滤
-        left_layout.addWidget(self.search_box)
-
-        # 文件列表（下部，占据剩余空间）
-        self.file_list = QListWidget()
-        self.file_list.itemClicked.connect(self.load_image)  # 点击文件时加载图片
-        left_layout.addWidget(self.file_list)
-
-        splitter.addWidget(left_panel)
-
-        # 快捷键绑定
-        # Ctrl+F：聚焦搜索框（context=self，主窗口任意位置可用）
-        QShortcut(QKeySequence("Ctrl+F"), self, self._focus_search_box)
-        # Esc：清空搜索框（context=self.search_box，仅搜索框有焦点时触发）
-        # Qt 在 shortcut 层拦截 Esc，不经过 keyPressEvent，避免与画布/主窗口冲突
-        QShortcut(QKeySequence("Escape"), self.search_box, self._clear_search)
+        # --- 1. 左侧面板（FileBrowser 替代）---
+        splitter.addWidget(self.file_browser)
         
         # --- 2. 图片画布（中间，自适应扩展）---
         self.canvas = ImageCanvas()
@@ -656,33 +534,17 @@ class MainWindow(QMainWindow):
         overlay = ShortcutOverlay(self)
         overlay.exec()
 
-    def _auto_restore_last(self):
-        """启动时自动恢复上次打开的文件夹/压缩包"""
-        config = load_config()
-        if not config.get("auto_open_last", True):
-            return
+    def _on_source_changed(self, source_path):
+        """来源切换 → 清空图片缓存 + 清空预翻译队列 + 更新标题"""
+        self.image_cache.clear()
+        self.prefetch_manager.clear()
+        self.setWindowTitle(f"BubbleTrans - {os.path.basename(source_path)}")
 
-        recent = config.get("recent_folders", [])
-        if not recent:
-            return
-
-        # 遍历最近列表，找到第一个存在的路径
-        for path in recent:
-            if os.path.exists(path):
-                _logger.info(f"自动恢复: {path}")
-                ext = os.path.splitext(path)[1].lower()
-                if ext in ('.cbz', '.zip', '.cbr'):
-                    self._load_source(path, is_archive=True)
-                else:
-                    self._load_source(path, is_archive=False)
-                return
-            else:
-                # 路径不存在，从列表中移除
-                _logger.info(f"自动恢复: 路径不存在，移除 {path}")
-                recent.remove(path)
-
-        # 所有路径都不存在，保存更新后的列表
-        save_config({"recent_folders": recent})
+    def _on_file_list_loaded(self):
+        """文件列表构建完成 → 触发首次图片加载"""
+        path = self.file_browser.current_file_path()
+        if path:
+            self.load_image(path)
     
     # ===================== 翻译进度辅助方法 =====================
     
@@ -785,14 +647,13 @@ class MainWindow(QMainWindow):
 
     def _clear_current_page_cache(self):
         """清除当前页的翻译缓存（无确认，即时清除）"""
-        if not hasattr(self.canvas, '_current_image_path') or not self.canvas._current_image_path:
+        if not self.canvas.current_image_path:
             self.status_bar.showMessage("当前无图片，无法清除缓存", 3000)
             return
-        image_path = self.canvas._current_image_path
-        removed = self.translation_cache.clear_image(image_path)
+        image_path = self.canvas.current_image_path
+        removed = self.translation_controller.clear_page_cache(image_path)
         if removed:
-            self.status_bar.showMessage(f"已清除当前页缓存", 3000)
-            # 清除右侧面板显示的旧翻译结果
+            self.status_bar.showMessage("已清除当前页缓存", 3000)
             self.origin_text = ""
             self.translated_text = ""
             self.shared_text_edit.clear()
@@ -802,7 +663,7 @@ class MainWindow(QMainWindow):
 
     def _clear_translation_cache(self):
         """清除全部翻译缓存（带确认对话框）"""
-        count = len(self.translation_cache)
+        count = self.translation_controller.cache_entry_count()
         if count == 0:
             self.status_bar.showMessage("缓存为空，无需清除", 3000)
             return
@@ -812,8 +673,7 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
-            self.translation_cache.clear()
-            # 清空右侧面板显示的旧翻译结果
+            self.translation_controller.clear_all_cache()
             self.origin_text = ""
             self.translated_text = ""
             self.shared_text_edit.clear()
@@ -822,514 +682,143 @@ class MainWindow(QMainWindow):
 
     # ===================== 槽函数 =====================
 
-    def _refresh_recent_menu(self):
-        """刷新最近打开路径的下拉菜单"""
-        self._recent_menu.clear()
-        config = load_config()
-        recent = config.get("recent_folders", [])
 
-        if not recent:
-            # 空列表时显示禁用占位项
-            empty_action = self._recent_menu.addAction("（无最近记录）")
-            empty_action.setEnabled(False)
-        else:
-            for path in recent:
-                # 过长路径中间截断显示
-                display = self._truncate_path(path, max_len=60)
-                action = self._recent_menu.addAction(display)
-                action.setToolTip(path)  # hover 显示完整路径
-                action.triggered.connect(lambda checked, p=path: self._open_recent_path(p))
-
-        self._recent_menu.addSeparator()
-        clear_action = self._recent_menu.addAction("清除历史")
-        clear_action.triggered.connect(self._clear_recent)
-
-    @staticmethod
-    def _truncate_path(path: str, max_len: int = 60) -> str:
-        """过长路径中间截断，如 D:/very/.../long/path/file.cbz"""
-        if len(path) <= max_len:
-            return path
-        # 保留头尾各一半长度
-        half = (max_len - 3) // 2
-        return path[:half] + "..." + path[-half:]
-
-    def _open_recent_path(self, path: str):
-        """从最近路径菜单打开指定路径"""
-        if not os.path.exists(path):
-            QMessageBox.warning(self, "路径不存在", f"以下路径已不存在，将自动移除：\n{path}")
-            # 移除不存在的路径
-            config = load_config()
-            recent = config.get("recent_folders", [])
-            if path in recent:
-                recent.remove(path)
-                save_config({"recent_folders": recent})
-            self._refresh_recent_menu()
-            return
-
-        # 判断是压缩包还是文件夹
-        ext = os.path.splitext(path)[1].lower()
-        if ext in ('.cbz', '.zip', '.cbr'):
-            self._load_source(path, is_archive=True)
-        else:
-            self._load_source(path, is_archive=False)
-
-    def _clear_recent(self):
-        """清除所有最近打开记录"""
-        save_config({"recent_folders": []})
-        self._refresh_recent_menu()
     
-    def open_folder(self):
-        """
-        打开文件夹对话框
-
-        弹出文件夹选择对话框，选择后加载文件夹中的图片文件
-        """
-        _logger.info("open_folder: 弹出目录选择对话框")
-        folder = QFileDialog.getExistingDirectory(self, "Select Comic Folder")
-        if folder:
-            self._load_source(folder, is_archive=False)
-
-    def open_archive(self):
-        """
-        打开漫画压缩包对话框
-
-        弹出文件选择对话框，选择 .cbz/.zip 压缩包后解压到临时目录并加载
-        """
-        _logger.info("open_archive: 弹出压缩包选择对话框")
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open Comic Archive",
-            "",
-            "Comic Archive (*.cbz *.zip *.cbr)"
-        )
-        if file_path:
-            self._load_source(file_path, is_archive=True)
-
-    def _load_source(self, path: str, is_archive: bool):
-        """
-        统一加载入口：文件夹或压缩包分发
-
-        参数:
-            path: 文件夹路径或压缩包文件路径
-            is_archive: True 表示压缩包，False 表示文件夹
-        """
-        # 清理上一次的压缩包临时目录（如有）
-        self._cleanup_archive_temp()
-        # 清空预翻译队列（切换来源时）
-        self.prefetch_manager.clear()
-
-        # 保存旧来源的阅读位置（F7：切换前记录；用 _source_path 作键，对压缩包稳定）
-        if self._source_path and self.current_file_index >= 0:
-            save_last_position(self._source_path, self.current_file_index)
-
-        # 记录原始来源路径（用于最近打开列表）
-        self._source_path = path
-
-        if is_archive:
-            archive_name = os.path.basename(path)
-            _logger.info(f"_load_source: 解压压缩包 {archive_name}")
-            try:
-                temp_dir, image_files = archive.extract_to_temp(path)
-                self._archive_temp_dir = temp_dir
-                self.current_folder = temp_dir
-            except (ValueError, zipfile.BadZipFile, OSError) as e:
-                _logger.error(f"_load_source: 解压失败 {archive_name}: {e}")
-                QMessageBox.critical(self, "解压失败", str(e))
-                return
-            except Exception as e:
-                # 兜底：捕获 CRC 校验失败(binascii.Error)等未预料的异常
-                _logger.error(f"_load_source: 解压遇到未知错误 {archive_name}: {e}")
-                QMessageBox.critical(self, "解压失败", f"无法打开压缩包: {e}")
-                return
-            _logger.info(f"_load_source: 解压完成 {archive_name}，共 {len(image_files)} 张图片")
-        else:
-            _logger.info(f"_load_source: 打开目录 {path}")
-            self.current_folder = path
-
-        # 清空旧缓存并加载文件列表
-        t0 = time.time()
-        self._clear_image_cache()
-        _logger.info(f"_load_source: _clear_image_cache 耗时 {time.time()-t0:.3f}s")
-        t1 = time.time()
-        self.load_file_list()
-        _logger.info(f"_load_source: load_file_list 耗时 {time.time()-t1:.3f}s")
-
-        # 状态栏文案
-        total = self.file_list.count()
-        if is_archive:
-            self.status_bar.showMessage(f"📦 {os.path.basename(path)} ({total} 页)")
-        else:
-            self.status_bar.showMessage(f"已加载: {os.path.basename(path)} ({total} 张)")
-
-        # 记录到最近打开列表
-        add_recent_folder(self._source_path)
-    
-    def load_file_list(self):
-        """
-        加载文件列表
-
-        从当前文件夹中读取图片文件，并显示在左侧列表中
-        支持的图片格式：jpg, jpeg, png, webp, bmp
-        """
-        self.file_list.clear()
-        valid_exts = ['.jpg', '.jpeg', '.png', '.webp', '.bmp']
-
-        try:
-            # 获取文件夹中所有符合条件的文件
-            t0 = time.time()
-            files = sorted([
-                f for f in os.listdir(self.current_folder)
-                if os.path.splitext(f)[1].lower() in valid_exts
-            ])
-            _logger.info(f"load_file_list: os.listdir + sorted 扫描 {len(files)} 个文件，耗时 {time.time()-t0:.3f}s")
-            # 添加到列表控件
-            t1 = time.time()
-            self.file_list.addItems(files)
-            _logger.info(f"load_file_list: addItems 耗时 {time.time()-t1:.3f}s")
-        except Exception as e:
-            _logger.error(f"load_file_list 失败: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to load folder: {e}")
-
-        # 恢复上次阅读位置（F7：用 _source_path 作键，对压缩包稳定）
-        if self.file_list.count() > 0:
-            saved_idx = get_last_position(self._source_path)
-            if 0 <= saved_idx < self.file_list.count():
-                self.file_list.setCurrentRow(saved_idx)
-                self.current_file_index = saved_idx
-                item = self.file_list.item(saved_idx)
-                self.load_image(item)
-            else:
-                self.file_list.setCurrentRow(0)
-                item = self.file_list.item(0)
-                self.load_image(item)
-
-    # ===================== 文件搜索 =====================
-
-    def filter_file_list(self, query: str):
-        """
-        根据搜索框输入实时过滤文件列表
-
-        遍历所有 item，将不匹配的项 setHidden(True)。
-        空 query 时恢复全部显示。
-
-        参数:
-            query: 搜索框中的文本（已自动触发 textChanged 信号）
-        """
-        query = query.strip().lower()
-        for i in range(self.file_list.count()):
-            item = self.file_list.item(i)
-            if not query:
-                item.setHidden(False)
-            else:
-                item.setHidden(query not in item.text().lower())
-
-    def _focus_search_box(self):
-        """Ctrl+F 快捷键槽：聚焦搜索框并全选当前文本"""
-        self.search_box.setFocus()
-        self.search_box.selectAll()
-
-    def _clear_search(self):
-        """
-        Esc 快捷键槽（仅搜索框有焦点时触发）：清空搜索框并失去焦点
-
-        焦点回到文件列表，方便用户继续用方向键浏览。
-        """
-        self.search_box.clear()
-        self.file_list.setFocus()
-    
-    def load_image(self, item):
-        """
-        加载图片到画布（带 LRU 缓存 + 异步解码 + 预加载）
-
-        当用户点击文件列表中的某个文件时调用
-
-        优化策略：
-        1. 命中 LRU 缓存 → 直接显示（秒开）
-        2. 未命中 → 显示"加载中…"占位，后台线程异步解码
-        3. 解码完成后自动触发相邻页预加载
-
-        参数:
-            item: 点击的列表项（QListWidgetItem）
-        """
-        file_name = item.text()
-        file_path = os.path.join(self.current_folder, file_name)
-        self.current_file_index = self.file_list.currentRow()
-        
-        # 立即更新页码和按钮状态（不等图片解码）
+    def load_image(self, file_path: str):
+        """加载指定路径的图片（由 file_selected 信号或键盘翻页驱动）"""
+        self.current_file_index = self.file_browser.current_file_index
         self._update_page_info()
-        
-        # === 第一步：检查 LRU 缓存 ===
-        if file_path in self.pixmap_cache:
-            pixmap = self.pixmap_cache[file_path]
-            self.pixmap_cache.move_to_end(file_path)  # 更新 LRU 位置（标记最近使用）
-            self.status_bar.showMessage(f"选中: {file_name} (缓存命中)")
+
+        pixmap = self.image_cache.get(file_path)
+        if pixmap is not None:
             self.canvas.load_image(file_path, pixmap=pixmap)
-            self._update_page_info()   # 刷新页码（_current_image_path 已正确设置）
+            self.status_bar.showMessage(f"选中: {os.path.basename(file_path)} (缓存命中)")
+            self._update_page_info()
             self._set_translating(False)
-            self._prefetch_adjacent()  # 仍然预加载相邻页
+            self._prefetch_adjacent()
             self._trigger_auto_prefetch()
             return
-        
-        # === 第二步：未命中缓存，异步加载 ===
+
         self.canvas.show_placeholder("加载中…")
-        self.status_bar.showMessage(f"加载中: {file_name}…")
+        self.status_bar.showMessage(f"加载中: {os.path.basename(file_path)}…")
         self._set_translating(False)
-        
-        # 启动后台解码线程
-        worker = ImageLoadWorker(file_path)
-        worker.loaded.connect(self._on_image_loaded)
-        worker.error.connect(self._on_image_load_error)
-        self.pending_loads[file_path] = worker
-        worker.start()
-    
-    # ===================== 图片缓存与异步加载辅助方法 =====================
-    
-    def _on_image_loaded(self, image_path, pixmap):
-        """异步图片解码完成回调 —— 加入缓存并渲染到画布"""
-        self._add_to_cache(image_path, pixmap)
-        self.pending_loads.pop(image_path, None)
-        
-        # 仅当用户没有在此间切到其他页时才渲染
-        current_item = self.file_list.currentItem()
+        self.image_cache.load_async(file_path)
+
+    def _on_image_cached(self, image_path, pixmap):
+        """图片异步解码完成 → 判断是否仍为当前页 → 渲染"""
+        current_item = self.file_browser.file_list.currentItem()
         if current_item:
-            current_path = os.path.join(self.current_folder, current_item.text())
+            current_path = os.path.join(self.file_browser.current_folder, current_item.text())
             if image_path == current_path:
                 self.canvas.load_image(image_path, pixmap=pixmap)
                 self.status_bar.showMessage(f"已加载: {os.path.basename(image_path)}")
-                self._update_page_info()   # 刷新页码指示器
+                self._update_page_info()
                 self._prefetch_adjacent()
                 self._trigger_auto_prefetch()
 
-    def _on_image_load_error(self, image_path, error_msg):
-        """异步图片解码失败回调"""
-        self.pending_loads.pop(image_path, None)
-        current_item = self.file_list.currentItem()
+    def _on_image_cache_error(self, image_path, error_msg):
+        """图片异步解码失败 → 判断是否仍为当前页 → 提示"""
+        current_item = self.file_browser.file_list.currentItem()
         if current_item:
-            current_path = os.path.join(self.current_folder, current_item.text())
+            current_path = os.path.join(self.file_browser.current_folder, current_item.text())
             if image_path == current_path:
                 self.canvas.show_placeholder(f"加载失败: {error_msg}")
                 self.status_bar.showMessage(f"错误: {error_msg}")
-    
-    def _add_to_cache(self, path, pixmap):
-        """向 LRU 缓存添加一条记录，超过上限时自动淘汰最旧的"""
-        if path in self.pixmap_cache:
-            self.pixmap_cache.move_to_end(path)
-        self.pixmap_cache[path] = pixmap
-        if len(self.pixmap_cache) > self.MAX_CACHE_SIZE:
-            # popitem(last=False) 弹出最旧的（最先插入的）
-            self.pixmap_cache.popitem(last=False)
-    
+
     def _prefetch_adjacent(self):
-        """预加载当前页前后的相邻页面到缓存"""
+        """计算相邻页路径，交给 ImageCacheManager 后台预加载"""
         if self.current_file_index < 0:
             return
-        total = self.file_list.count()
-        for offset in range(1, self.PREFETCH_RANGE + 1):
+        total = self.file_browser.files_count()
+        paths = []
+        for offset in range(1, self.image_cache.prefetch_range + 1):
             for idx in (self.current_file_index + offset, self.current_file_index - offset):
                 if 0 <= idx < total:
-                    file_path = os.path.join(self.current_folder,
-                                             self.file_list.item(idx).text())
-                    # 跳过已缓存或正在加载的
-                    if file_path in self.pixmap_cache or file_path in self.pending_loads:
-                        continue
-                    worker = ImageLoadWorker(file_path)
-                    worker.loaded.connect(self._on_prefetch_loaded)
-                    # 预加载错误静默忽略
-                    worker.error.connect(lambda p, e: self.pending_loads.pop(p, None))
-                    self.pending_loads[file_path] = worker
-                    worker.start()
-    
-    def _on_prefetch_loaded(self, image_path, pixmap):
-        """预加载完成回调 —— 静默加入缓存，不渲染到画布"""
-        self._add_to_cache(image_path, pixmap)
-        self.pending_loads.pop(image_path, None)
-    
+                    paths.append(os.path.join(self.file_browser.current_folder,
+                                              self.file_browser.file_list.item(idx).text()))
+        if paths:
+            self.image_cache.prefetch(paths)
+
     def _clear_image_cache(self):
-        """清空所有图片缓存和进行中的加载（切换文件夹时调用）"""
-        self.pixmap_cache.clear()
-        # 终止所有进行中的后台解码线程
-        for path, worker in list(self.pending_loads.items()):
-            if worker.isRunning():
-                worker.terminate()
-                worker.wait(500)        # 等待线程结束（最多0.5秒，避免阻塞UI）
-                worker.deleteLater()    # 安全释放 Qt 资源
-        self.pending_loads.clear()
+        """清空图片缓存（切换来源时调用）"""
+        self.image_cache.clear()
         self.current_file_index = -1
-        # 隐藏导航按钮和页码指示器
         self.canvas._hide_nav_overlay()
-    
+
     # ===================== 页面导航 =====================
-    
+
     def _nav_prev_page(self):
         """← 前翻页（由画布箭头按钮或键盘左方向键触发）"""
         self._navigate_page(-1)
-    
+
     def _nav_next_page(self):
         """→ 后翻页（由画布箭头按钮或键盘右方向键触发）"""
         self._navigate_page(1)
-    
-    def _navigate_page(self, delta: int):
-        """
-        执行翻页：修改文件列表选中项并触发图片加载
 
-        过滤状态下自动跳过隐藏项，跳到下一个可见项；
-        如果方向上没有可见项（到达边界），则不翻页。
-        """
-        count = self.file_list.count()
-        if count == 0:
-            return
-        current = self.file_list.currentRow()
-        new_row = current
-        while True:
-            new_row += delta
-            if new_row < 0 or new_row >= count:
-                return  # 边界外，不翻页
-            if not self.file_list.item(new_row).isHidden():
-                break
-        self.file_list.setCurrentRow(new_row)
-        item = self.file_list.item(new_row)
-        self.load_image(item)
-    
+    def _navigate_page(self, delta: int):
+        """执行翻页：修改文件列表选中项并触发图片加载"""
+        path = self.file_browser.navigate(delta)
+        if path:
+            self.load_image(path)
+
     def _update_page_info(self):
         """刷新画布上的页码指示器和按钮可用状态"""
-        count = self.file_list.count()
+        count = self.file_browser.files_count()
         if count == 0:
             return
-        current = self.file_list.currentRow()
+        current = self.file_browser.current_file_index
         if current >= 0:
             self.canvas.update_page_indicator(current + 1, count)
-        # 首页禁用前翻，末页禁用后翻（仅当按钮已初始化时）
         if self.canvas._btn_prev is not None and self.canvas._btn_next is not None:
             self.canvas._btn_prev.setEnabled(current > 0)
             self.canvas._btn_next.setEnabled(current < count - 1)
-        # 预翻译按钮：最后一页或只有 1 页时禁用
         if hasattr(self, 'prefetch_btn'):
-            total = self.file_list.count()
-            current = self.file_list.currentRow()
-            self.prefetch_btn.setEnabled(total > 1 and current < total - 1)
-    
-    # ===================== 设置对话框 =====================
-    
-    def open_settings(self):
-        """
-        打开设置对话框
-        
-        弹出设置对话框，让用户配置OCR和LLM相关设置
-        """
-        dlg = SettingsDialog(self)
-        dlg.exec()  # exec()以模态方式显示对话框
-    
-    # ===================== 分段切换 =====================
-    
-    def _switch_tab(self, tab):
-        """
-        切换原文/译文 tab
+            self.prefetch_btn.setEnabled(count > 1 and current < count - 1)
 
-        参数:
-            tab: "origin" 或 "trans"
-        """
+    # ===================== 设置对话框 =====================
+
+    def open_settings(self):
+        dlg = SettingsDialog(self)
+        dlg.exec()
+
+    # ===================== 分段切换 =====================
+
+    def _switch_tab(self, tab):
         self.current_tab = tab
         self.btn_origin_seg.setChecked(tab == "origin")
         self.btn_trans_seg.setChecked(tab == "trans")
         text = self.origin_text if tab == "origin" else self.translated_text
         self.shared_text_edit.setText(text if text else "")
-    
+
     # ===================== 翻译回调 =====================
-    
+
     def handle_region_selected(self, pixmap: QPixmap):
-        """
-        处理框选区域完成事件
-        
-        当用户在画布上完成框选后，此方法被调用
-        弹出确认对话框，用户确认后开始翻译
-        
-        参数:
-            pixmap: 框选的图片区域（QPixmap格式）
-        """
+        """处理框选区域完成事件"""
         self.status_bar.showMessage("已选中区域，等待确认...", 3000)
-        
-        # 创建确认对话框
         dlg = CropConfirmDialog(pixmap, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             self.status_bar.showMessage("已取消本次选区", 3000)
             return
-        
-        # 用户确认后，开始处理
-        self._set_translating(True)
-        self.status_bar.showMessage("翻译中...")
+        image_path = self.canvas.current_image_path or ""
+        self.translation_controller.translate_region(image_path, pixmap)
+
+    def _on_translation_stage(self, stage: str):
+        self.status_bar.showMessage(stage)
+
+    def _on_translation_started(self):
         self.origin_text = ""
         self.translated_text = ""
         self.shared_text_edit.clear()
-        
-        # 保存临时文件（使用唯一文件名，避免并发冲突）
-        try:
-            temp_dir = tempfile.gettempdir()
-            # 用 uuid 生成唯一文件名，避免多次框选时的并发覆盖问题
-            unique_name = f"bubbletrans_{uuid.uuid4().hex[:8]}.png"
-            temp_path = os.path.join(temp_dir, unique_name)
-            self._translating_image_path = temp_path  # 临时文件路径（缓存时会过滤）
-            pixmap.save(temp_path, "PNG")
-            self._temp_files.append(temp_path)  # 记录待清理的临时文件
-            
-            # 启动翻译工作线程
-            self.worker = TranslationWorker(temp_path)
-            # 连接信号（线程完成时更新UI）
-            self.worker.stage_changed.connect(self._on_translation_stage)
-            self.worker.finished.connect(self.on_translation_finished)
-            self.worker.error.connect(self.on_translation_error)
-            self.worker.start()  # 启动线程
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"保存临时图片失败: {e}")
-    
-    def _on_translation_stage(self, stage: str):
-        """翻译阶段变化 → 更新状态栏"""
-        self.status_bar.showMessage(stage)
+        self.status_bar.showMessage("翻译中...")
 
-    def on_translation_finished(self, origin_text, translated_text, summary_dict):
-        """
-        翻译完成回调函数
-
-        当TranslationWorker完成翻译后，此方法被调用
-
-        参数:
-            origin_text:     原文文本
-            translated_text: 译文文本
-            summary_dict:    总结数据字典 {"plot": "剧情摘要", "notes": "翻译备注"}
-        """
+    def _on_translation_finished(self, origin_text, translated_text, summary_dict):
         self.origin_text = origin_text
         self.translated_text = translated_text
-
-        # 仅缓存完整页面翻译结果（非临时文件的框选翻译）
-        if not llm_engine.last_from_cache and self._translating_image_path:
-            current_path = self._translating_image_path
-            if current_path and os.path.exists(current_path):
-                # 框选翻译使用临时文件，不应缓存
-                is_temp = tempfile.gettempdir() in current_path
-                if not is_temp:
-                    mtime = os.path.getmtime(current_path)
-                    self.translation_cache.set(current_path, mtime, {
-                        "original": origin_text,
-                        "translated": translated_text,
-                        "summary": summary_dict,
-                    })
-                    self.translation_cache.save()
-
-        # 无论是否缓存命中，都重置翻译路径标记
-        # Bug修复：之前仅在缓存未命中时重置，导致缓存命中后此标记残留
-        self._translating_image_path = ""
-
-        # 自动切换到译文 tab
         self._switch_tab("trans")
-        
-        # 填充总结区
         self._fill_summary(summary_dict)
-
-        self._set_translating(False)
         self.status_bar.showMessage("翻译完成", 5000)
 
     def _fill_summary(self, summary_dict):
-        """填充总结区（剧情 + 翻译备注）"""
         if summary_dict and (summary_dict.get("plot") or summary_dict.get("notes")):
             plot = summary_dict.get("plot", "").strip()
             notes = summary_dict.get("notes", "").strip()
@@ -1350,55 +839,15 @@ class MainWindow(QMainWindow):
         else:
             self.summary_text_edit.setPlainText("本页暂未生成总结")
 
-    def on_translation_error(self, error_msg):
-        """
-        翻译错误回调函数
-        
-        当TranslationWorker发生错误时，此方法被调用
-        
-        参数:
-            error_msg: 错误信息
-        """
+    def _on_translation_error(self, error_msg):
         self.status_bar.showMessage(f"错误: {error_msg}")
-        self._set_translating(False)
         QMessageBox.warning(self, "翻译失败", error_msg)
-    
-    def _cleanup_worker(self):
-        """
-        安全清理翻译线程：先断开信号连接再终止，防止残留信号干扰后续翻译
-
-        修复背景：旧代码直接用 terminate() 杀死线程，但没有先断开信号。
-        虽然 terminate() 后信号不会 emit，但在极端的竞态窗口（run() 即将
-        emit 时被 terminate），可能导致信号队列中有待处理事件。
-        """
-        if self.worker is None:
-            return
-        # 先断开信号连接，彻底断绝信号到达的可能性
-        try:
-            self.worker.stage_changed.disconnect()
-        except (TypeError, RuntimeError):
-            pass
-        try:
-            self.worker.finished.disconnect()
-        except (TypeError, RuntimeError):
-            pass
-        try:
-            self.worker.error.disconnect()
-        except (TypeError, RuntimeError):
-            pass
-        # 如果线程仍在运行，强制终止
-        if self.worker.isRunning():
-            self.worker.terminate()
-            self.worker.wait(500)
-        self.worker.deleteLater()
-        self.worker = None
 
     def _set_translating(self, active: bool):
-        """设置翻译进行中状态，防止重复点击，并切换骨架屏/按钮动画"""
         self.translate_page_btn.setEnabled(not active)
         if active:
             self._spinner_dots = 0
-            self._spinner_timer.start(500)   # 每 0.5s 切换省略号
+            self._spinner_timer.start(500)
             self._show_skeleton(True)
             self._start_skeleton_pulse()
         else:
@@ -1406,27 +855,22 @@ class MainWindow(QMainWindow):
             self.translate_page_btn.setText("翻译当前页")
             self._show_skeleton(False)
             self._stop_skeleton_pulse()
-            # 安全清理旧 worker（先断开信号再终止）
-            self._cleanup_worker()
-            # 清理残留的临时文件
-            self._clean_temp_files()
-    
+
     def _manual_prefetch(self, count: int):
         """手动预翻译：将后续 count 页加入预翻译队列（不含当前页）"""
-        total = self.file_list.count()
+        total = self.file_browser.files_count()
         start = self.current_file_index + 1
         end = min(start + count, total)
         if start >= total:
             return
         paths = []
         for i in range(start, end):
-            item = self.file_list.item(i)
+            item = self.file_browser.file_list.item(i)
             if item:
-                paths.append(os.path.join(self.current_folder, item.text()))
+                paths.append(os.path.join(self.file_browser.current_folder, item.text()))
         if paths:
             self.prefetch_manager.enqueue(paths)
             self.status_bar.showMessage(f"📦 预翻译: 已加入 {len(paths)} 页")
-            # 按钮进入执行态，由 _on_prefetch_all_completed 恢复
             self.prefetch_btn.setText("预翻译中…")
 
     def _trigger_auto_prefetch(self):
@@ -1434,15 +878,10 @@ class MainWindow(QMainWindow):
         config = load_config()
         if not config.get("prefetch_enabled", False):
             return
-        total = self.file_list.count()
+        total = self.file_browser.files_count()
         if self.current_file_index < 0 or total == 0:
             return
-        # 构建当前页面路径有序列表
-        page_paths = []
-        for i in range(total):
-            item = self.file_list.item(i)
-            if item:
-                page_paths.append(os.path.join(self.current_folder, item.text()))
+        page_paths = self.file_browser.get_file_paths()
         prefetch_count = config.get("prefetch_count", 3)
         self.prefetch_manager.resync(self.current_file_index, page_paths, prefetch_count)
 
@@ -1452,13 +891,13 @@ class MainWindow(QMainWindow):
 
     def _on_prefetch_page_completed(self, image_path: str):
         """预翻译单页完成 → 如果当前正显示该页，刷新 UI 面板"""
-        if not hasattr(self.canvas, '_current_image_path'):
+        if not self.canvas.current_image_path:
             return
-        if image_path != self.canvas._current_image_path:
+        if image_path != self.canvas.current_image_path:
             return
 
         # 如果主翻译正在处理同一页，让主翻译的回调来刷新 UI，避免重复刷新
-        if self.worker is not None and self.worker.isRunning():
+        if self.translation_controller.is_translating():
             return
 
         # 从缓存读取结果并刷新右侧面板
@@ -1487,28 +926,13 @@ class MainWindow(QMainWindow):
         self.prefetch_btn.setText("预翻译")
 
     def translate_current_page(self):
-        """翻译当前画布中显示的整张图片"""
-        # 重入保护：先清理上一个 worker，防止新旧 worker 竞争
-        self._cleanup_worker()
-
-        if not hasattr(self.canvas, '_current_image_path') or not self.canvas._current_image_path:
+        """F5 翻译当前页"""
+        if not self.canvas.current_image_path:
             self.status_bar.showMessage("请先打开一张图片", 3000)
             return
-        
-        image_path = self.canvas._current_image_path
-        # 从预翻译队列中提升当前页（如正在预翻译则不终止）
+        image_path = self.canvas.current_image_path
         self.prefetch_manager.promote(image_path)
-        self._translating_image_path = image_path  # 记录路径用于缓存写回
-        self._set_translating(True)
-        self.origin_text = ""
-        self.translated_text = ""
-        self.shared_text_edit.clear()
-        
-        self.worker = TranslationWorker(image_path)
-        self.worker.stage_changed.connect(self._on_translation_stage)
-        self.worker.finished.connect(self.on_translation_finished)
-        self.worker.error.connect(self.on_translation_error)
-        self.worker.start()
+        self.translation_controller.translate_page(image_path)
     
     def keyPressEvent(self, event):
         """键盘快捷键：左右方向键翻页、F5 翻译当前页、Ctrl+Shift+F5 预翻译下 3 页"""
@@ -1524,56 +948,15 @@ class MainWindow(QMainWindow):
         else:
             super().keyPressEvent(event)
     
-    # ===================== 资源清理 =====================
-    
-    def _clean_temp_files(self):
-        """清理所有记录的临时文件"""
-        for f in self._temp_files:
-            try:
-                if os.path.exists(f):
-                    os.remove(f)
-            except OSError:
-                pass  # 文件被占用或已删除，忽略
-        self._temp_files.clear()
-    
-    def _cleanup_archive_temp(self):
-        """
-        清理压缩包临时解压目录
-
-        在切换来源（打开新的文件夹/压缩包）和关闭程序时调用
-        """
-        if self._archive_temp_dir and os.path.exists(self._archive_temp_dir):
-            _logger.info(f"_cleanup_archive_temp: 清理临时目录 {self._archive_temp_dir}")
-            try:
-                shutil.rmtree(self._archive_temp_dir, ignore_errors=True)
-            except Exception as e:
-                _logger.warning(f"_cleanup_archive_temp: 清理失败 {e}")
-            self._archive_temp_dir = ""
-
     def closeEvent(self, event):
         """窗口关闭时优雅停止所有后台线程并清理临时目录和文件"""
-        # 保存当前阅读位置（F7：关闭前记录；用 _source_path 作键，对压缩包稳定）
-        if self._source_path and self.current_file_index >= 0:
-            save_last_position(self._source_path, self.current_file_index)
-
+        # 文件浏览器关闭清理（保存阅读位置 + 清理压缩包临时目录）
+        self.file_browser.shutdown()
         # 终止预翻译 worker
         self.prefetch_manager.clear()
-        # 终止翻译 worker
-        if self.worker and self.worker.isRunning():
-            self.worker.terminate()
-            self.worker.wait(3000)
-            self.worker.deleteLater()
-            self.worker = None
-        # 终止所有图片加载 worker
-        for path, worker in list(self.pending_loads.items()):
-            if worker.isRunning():
-                worker.terminate()
-                worker.wait(3000)
-                worker.deleteLater()
-        self.pending_loads.clear()
-        # 清理临时文件（框选翻译产生的临时图片）
-        self._clean_temp_files()
-        # 清理压缩包临时解压目录
-        self._cleanup_archive_temp()
+        # 终止翻译 worker + 清理临时文件
+        self.translation_controller.shutdown()
+        # 终止图片缓存管理器中的后台 worker
+        self.image_cache.clear()
         # QA：清理完成，标记关闭事件已接受
         event.accept()

@@ -19,6 +19,7 @@ import json
 import hashlib
 import logging
 from collections import OrderedDict
+import threading
 
 _logger = logging.getLogger("BubbleTrans")
 
@@ -60,6 +61,7 @@ class TranslationCache:
 
         self.cache_path = cache_path
         self._data = OrderedDict()
+        self._lock = threading.RLock()
         self._load()
 
     # ===================== 磁盘 I/O =====================
@@ -97,12 +99,13 @@ class TranslationCache:
 
     def save(self):
         """持久化内存缓存到 JSON 文件"""
-        try:
-            with open(self.cache_path, 'w', encoding='utf-8') as f:
-                json.dump(self._data, f, indent=2, ensure_ascii=False)
-            _logger.debug(f"缓存已保存 ({len(self._data)} 条)")
-        except Exception as e:
-            _logger.warning(f"保存缓存失败: {e}")
+        with self._lock:
+            try:
+                with open(self.cache_path, 'w', encoding='utf-8') as f:
+                    json.dump(self._data, f, indent=2, ensure_ascii=False)
+                _logger.debug(f"缓存已保存 ({len(self._data)} 条)")
+            except Exception as e:
+                _logger.warning(f"保存缓存失败: {e}")
 
     # ===================== 缓存操作 =====================
 
@@ -132,18 +135,19 @@ class TranslationCache:
             命中时返回 {"original": str, "translated": str, "summary": dict}
             未命中（或缓存为错误内容）返回 None
         """
-        key = self._make_key(image_path, mtime)
-        if key in self._data:
-            self._data.move_to_end(key)
-            entry = self._data[key]
-            # 过滤错误缓存：原文为空且译文包含错误关键词
-            if self._is_error_entry(entry):
-                _logger.info(f"检测到错误缓存，跳过: {os.path.basename(image_path)}")
-                del self._data[key]
-                return None
-            _logger.debug(f"缓存命中: {os.path.basename(image_path)}")
-            return entry
-        return None
+        with self._lock:
+            key = self._make_key(image_path, mtime)
+            if key in self._data:
+                self._data.move_to_end(key)
+                entry = self._data[key]
+                # 过滤错误缓存：原文为空且译文包含错误关键词
+                if self._is_error_entry(entry):
+                    _logger.info(f"检测到错误缓存，跳过: {os.path.basename(image_path)}")
+                    del self._data[key]
+                    return None
+                _logger.debug(f"缓存命中: {os.path.basename(image_path)}")
+                return entry
+            return None
 
     def set(self, image_path, mtime, data):
         """
@@ -154,27 +158,28 @@ class TranslationCache:
             mtime: 文件修改时间戳
             data: {"original": str, "translated": str, "summary": dict}
         """
-        import time
+        with self._lock:
+            import time
 
-        key = self._make_key(image_path, mtime)
-        entry = {
-            "image_path": image_path,
-            "original": data.get("original", ""),
-            "translated": data.get("translated", ""),
-            "summary": data.get("summary", {}),
-            "timestamp": time.time(),
-        }
+            key = self._make_key(image_path, mtime)
+            entry = {
+                "image_path": image_path,
+                "original": data.get("original", ""),
+                "translated": data.get("translated", ""),
+                "summary": data.get("summary", {}),
+                "timestamp": time.time(),
+            }
 
-        # 如果已存在同一键（重复翻译同一文件同版本），移到末尾
-        if key in self._data:
-            self._data.move_to_end(key)
-        self._data[key] = entry
+            # 如果已存在同一键（重复翻译同一文件同版本），移到末尾
+            if key in self._data:
+                self._data.move_to_end(key)
+            self._data[key] = entry
 
-        # LRU 淘汰：超出上限时移除最旧的条目
-        while len(self._data) > MAX_ENTRIES:
-            self._data.popitem(last=False)
+            # LRU 淘汰：超出上限时移除最旧的条目
+            while len(self._data) > MAX_ENTRIES:
+                self._data.popitem(last=False)
 
-        _logger.debug(f"已缓存: {os.path.basename(image_path)} (共 {len(self._data)} 条)")
+            _logger.debug(f"已缓存: {os.path.basename(image_path)} (共 {len(self._data)} 条)")
 
     # ===================== 降级查询 =====================
 
@@ -192,13 +197,14 @@ class TranslationCache:
             命中时返回 {"original": str, "translated": str, "summary": dict}
             无历史缓存（或仅有错误缓存）时返回 None
         """
-        for key in reversed(self._data):
-            entry = self._data[key]
-            if entry.get("image_path") == image_path:
-                if self._is_error_entry(entry):
-                    continue  # 跳过错误缓存
-                _logger.info(f"缓存降级命中: {os.path.basename(image_path)}")
-                return entry
+        with self._lock:
+            for key in reversed(self._data):
+                entry = self._data[key]
+                if entry.get("image_path") == image_path:
+                    if self._is_error_entry(entry):
+                        continue  # 跳过错误缓存
+                    _logger.info(f"缓存降级命中: {os.path.basename(image_path)}")
+                    return entry
         return None
 
     # ===================== 缓存管理 =====================
@@ -227,18 +233,19 @@ class TranslationCache:
         返回:
             清除的条目数
         """
-        removed = 0
-        keys_to_remove = []
-        for key, entry in self._data.items():
-            if entry.get("image_path") == image_path:
-                keys_to_remove.append(key)
-        for key in keys_to_remove:
-            del self._data[key]
-            removed += 1
-        if removed:
-            _logger.info(f"已清除 {image_path} 的 {removed} 条缓存")
-            self.save()
-        return removed
+        with self._lock:
+            removed = 0
+            keys_to_remove = []
+            for key, entry in self._data.items():
+                if entry.get("image_path") == image_path:
+                    keys_to_remove.append(key)
+            for key in keys_to_remove:
+                del self._data[key]
+                removed += 1
+            if removed:
+                _logger.info(f"已清除 {image_path} 的 {removed} 条缓存")
+                self.save()
+            return removed
 
     def clear(self):
         """
@@ -247,12 +254,14 @@ class TranslationCache:
         返回:
             清除的条目数
         """
-        count = len(self._data)
-        self._data.clear()
-        self.save()
-        _logger.info(f"已清除全部缓存 ({count} 条)")
-        return count
+        with self._lock:
+            count = len(self._data)
+            self._data.clear()
+            self.save()
+            _logger.info(f"已清除全部缓存 ({count} 条)")
+            return count
 
     def __len__(self):
         """返回当前缓存条目数"""
-        return len(self._data)
+        with self._lock:
+            return len(self._data)

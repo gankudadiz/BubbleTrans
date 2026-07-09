@@ -45,6 +45,9 @@ import os             # 文件系统操作
 # 配置文件名，相对于项目根目录
 CONFIG_FILE = "config.json"
 
+# 内存缓存：避免频繁读磁盘
+_cached_config = None
+
 
 # ============================================================================
 # 加载配置
@@ -54,30 +57,23 @@ def load_config():
     加载配置文件
     
     从config.json读取配置，返回配置字典
-    
-    返回:
-        dict: 配置字典，如果文件不存在或读取失败返回空字典
-        
-    错误处理：
-    - 文件不存在：返回{}
-    - JSON解析错误：打印错误并返回{}
-    - 权限错误：打印错误并返回{}
-    
-    示例:
-        config = load_config()
-        api_key = config.get("api_key", "")
     """
-    # 检查文件是否存在
+    global _cached_config
+    if _cached_config is not None:
+        return _cached_config
+
     if not os.path.exists(CONFIG_FILE):
-        return {}
-    
+        _cached_config = {}
+        return _cached_config
+
     try:
-        # 读取并解析JSON文件
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            _cached_config = json.load(f)
+        return _cached_config
     except Exception as e:
         print(f"Error loading config: {e}")
-        return {}
+        _cached_config = {}
+        return _cached_config
 
 
 # ============================================================================
@@ -120,12 +116,19 @@ def save_config(data):
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             # indent=4 使用4空格缩进，使JSON文件更易读
             json.dump(current_config, f, indent=4)
+            _cached_config = current_config
         
         return True
         
     except Exception as e:
         print(f"Error saving config: {e}")
         return False
+
+
+def invalidate_config_cache():
+    """供外部修改 config.json 后手动刷新内存缓存"""
+    global _cached_config
+    _cached_config = None
 
 
 # ============================================================================
