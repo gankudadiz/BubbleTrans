@@ -451,7 +451,7 @@ class LLMEngine:
             result.append(line)
         return '\n'.join(result)
     
-    def translate_image(self, image_path):
+    def translate_image(self, image_path, context: str | None = None):
         """
         翻译图片中的文字
 
@@ -460,6 +460,9 @@ class LLMEngine:
 
         参数:
             image_path: 图片文件路径
+            context: 可选的前情提要上下文文本（如"【前情提要】\n第5页：…"），
+                     作为额外的系统提示注入，帮助 LLM 保持跨页剧情连贯。
+                     为 None 或空字符串时行为与之前一致。
 
         返回:
             (origin_text, translated_text, summary_dict) 三元组
@@ -491,6 +494,8 @@ class LLMEngine:
 
         # ===== 构建系统提示词 =====
         system_prompt = self._build_system_prompt(self.target_lang)
+        if context:
+            system_prompt = system_prompt + "\n\n" + context
 
         # ===== 编码图片 =====
         base64_image = self.encode_image(image_path)

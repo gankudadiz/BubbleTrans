@@ -12,7 +12,7 @@ BubbleTrans - 压缩包工具模块
 注意事项：
 - .cbz / .zip 使用标准库 zipfile，零额外依赖
 - .cbr 使用项目内嵌的 7z.exe（bin/ 目录），通过 subprocess 调用
-- 解压目录使用 tempfile.mkdtemp 创建，调用方负责清理
+- 解压目录根据压缩包路径 MD5 生成固定目录（确保跨会话缓存命中），调用方负责清理
 - 过滤 __MACOSX/ 资源叉和 .DS_Store 垃圾文件
 """
 
@@ -23,6 +23,7 @@ import os             # 文件路径操作
 import shutil          # 目录清理（RAR 解压失败时的资源回收）
 import subprocess     # 调用外部 7z.exe（RAR/CBR 解压）
 import sys            # 平台判断（CREATE_NO_WINDOW）
+import time           # 恢复 ZIP 内部时间戳
 import tempfile       # 临时目录
 import zipfile        # ZIP 压缩包读写（标准库）
 
@@ -38,6 +39,13 @@ IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp')
 
 # 临时目录前缀，方便排查
 TEMP_DIR_PREFIX = "bubbletrans_arc_"
+
+
+def _get_archive_temp_dir(archive_path: str) -> str:
+    """根据压缩包路径生成确定性的临时目录（确保跨会话路径一致）"""
+    import hashlib
+    archive_hash = hashlib.md5(archive_path.encode('utf-8')).hexdigest()[:12]
+    return os.path.join(tempfile.gettempdir(), f"{TEMP_DIR_PREFIX}{archive_hash}")
 
 
 # ============================================================================
@@ -160,12 +168,38 @@ def _extract_zip(archive_path: str) -> tuple:
         if not image_files:
             raise ValueError(f"压缩包中未找到图片: {os.path.basename(archive_path)}")
 
-        temp_dir = tempfile.mkdtemp(prefix=TEMP_DIR_PREFIX)
+        temp_dir = _get_archive_temp_dir(archive_path)
+        # 如果目录已存在（上次会话残留），先清空
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        os.makedirs(temp_dir, exist_ok=True)
 
         for name in image_files:
             zf.extract(name, temp_dir)
+            _restore_zip_mtime(zf, name, temp_dir)
 
     return temp_dir, image_files
+
+
+def _restore_zip_mtime(zf: zipfile.ZipFile, member_name: str, temp_dir: str) -> None:
+    """
+    将 ZIP 内文件的修改时间恢复为压缩包里记录的时间。
+
+    这样重新打开同一个压缩包时，解压出来的图片 mtime 不会随当前时间变化，
+    进而保证基于 image_path + mtime 的缓存 key 稳定。
+    """
+    try:
+        info = zf.getinfo(member_name)
+        extracted_path = os.path.join(temp_dir, member_name)
+        if not os.path.exists(extracted_path):
+            return
+
+        # ZipInfo.date_time 是本地时间，精度到 2 秒，足够用于当前缓存 key。
+        dt = info.date_time
+        mtime = time.mktime((dt[0], dt[1], dt[2], dt[3], dt[4], dt[5], 0, 0, -1))
+        os.utime(extracted_path, (mtime, mtime))
+    except Exception as e:
+        _logger.debug(f"_restore_zip_mtime failed for {member_name}: {e}")
 
 
 # ============================================================================
@@ -192,7 +226,10 @@ def _extract_rar(archive_path: str) -> tuple:
         )
 
     archive_name = os.path.basename(archive_path)
-    temp_dir = tempfile.mkdtemp(prefix=TEMP_DIR_PREFIX)
+    temp_dir = _get_archive_temp_dir(archive_path)
+    if os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    os.makedirs(temp_dir, exist_ok=True)
 
     # Windows 下隐藏 7z 的控制台窗口
     creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0

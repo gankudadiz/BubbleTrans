@@ -27,20 +27,24 @@ class TranslationController(QObject):
         super().__init__(parent)
         self._cache = translation_cache
         self._worker = None
-        self._translating_image_path = ""  # 正在翻译的图片路径（缓存判断用）
-        self._temp_files = []              # 框选翻译产生的临时文件
+        self._translating_image_path = ""         # 正在翻译的图片路径（缓存判断用）
+        self._translating_page_index = None       # 翻译启动时捕获的页码
+        self._is_temp_image = False               # 当前图片是否为临时文件（框选翻译产物，不缓存）
+        self._temp_files = []                     # 框选翻译产生的临时文件
 
     # ===================== 翻译操作 =====================
 
-    def translate_page(self, image_path):
+    def translate_page(self, image_path, context=None, page_index=None):
         """翻译整张图片"""
         self._cancel_worker()              # 先清理上一个 worker
         self._translating_image_path = image_path
+        self._translating_page_index = page_index  # 翻译启动时即捕获
+        self._is_temp_image = False        # 非临时文件，结果应缓存
         self.translation_started.emit()
         self.translating_changed.emit(True)
-        self._start_worker(image_path)
+        self._start_worker(image_path, context=context)
 
-    def translate_region(self, image_path, region_pixmap):
+    def translate_region(self, image_path, region_pixmap, context=None, page_index=None):
         """翻译框选区域：暂存为临时文件 → 启动 Worker"""
         self._cancel_worker()
         try:
@@ -48,11 +52,13 @@ class TranslationController(QObject):
             unique_name = f"bubbletrans_{uuid.uuid4().hex[:8]}.png"
             temp_path = os.path.join(temp_dir, unique_name)
             self._translating_image_path = temp_path
+            self._translating_page_index = page_index  # 捕获页码
+            self._is_temp_image = True       # 临时文件，不缓存
             region_pixmap.save(temp_path, "PNG")
             self._temp_files.append(temp_path)
             self.translation_started.emit()
             self.translating_changed.emit(True)
-            self._start_worker(temp_path)
+            self._start_worker(temp_path, context=context)
         except Exception as e:
             self.translation_error.emit(f"保存临时图片失败: {e}")
 
@@ -63,9 +69,9 @@ class TranslationController(QObject):
 
     # ===================== Worker 生命周期 =====================
 
-    def _start_worker(self, image_path):
+    def _start_worker(self, image_path, context=None):
         """创建并启动 TranslationWorker，连接信号"""
-        self._worker = TranslationWorker(image_path)
+        self._worker = TranslationWorker(image_path, context=context)
         self._worker.stage_changed.connect(self._on_stage)
         self._worker.finished.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
@@ -79,16 +85,17 @@ class TranslationController(QObject):
         # 写缓存（仅非临时文件，且结果不是来自缓存命中）
         current_path = self._translating_image_path
         if current_path and os.path.exists(current_path) and not llm_engine.last_from_cache:
-            is_temp = tempfile.gettempdir() in current_path
-            if not is_temp:
+            if not self._is_temp_image:
                 mtime = os.path.getmtime(current_path)
                 self._cache.set(current_path, mtime, {
                     "original": origin_text,
                     "translated": translated_text,
                     "summary": summary_dict,
-                })
-                self._cache.save()
+                }, page_index=self._translating_page_index)
+                # SQLite 即时落盘，无需显式 save()
         self._translating_image_path = ""
+        self._translating_page_index = None
+        self._is_temp_image = False
         self.translating_changed.emit(False)
         self.translation_finished.emit(origin_text, translated_text, summary_dict)
         self._clean_temp_files()
@@ -96,6 +103,8 @@ class TranslationController(QObject):
 
     def _on_error(self, error_msg):
         self._translating_image_path = ""
+        self._translating_page_index = None
+        self._is_temp_image = False
         self.translating_changed.emit(False)
         self.translation_error.emit(error_msg)
         self._cleanup_worker()
@@ -131,6 +140,7 @@ class TranslationController(QObject):
     def cancel(self):
         """外部取消当前翻译"""
         self._translating_image_path = ""
+        self._translating_page_index = None
         self.translating_changed.emit(False)
         self._cancel_worker()
         self._clean_temp_files()

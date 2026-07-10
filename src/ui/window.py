@@ -46,6 +46,8 @@ from PyQt6.QtWidgets import (
     QCheckBox,         # 复选框
     QLineEdit,         # 单行文本输入框（搜索框）
     QMenu,             # 弹出菜单
+    QProgressBar,      # 进度条
+    QSpinBox,          # 数字调节框（批量翻译范围选择）
 )
 
 from PyQt6.QtGui import (
@@ -94,7 +96,11 @@ from engine.workers import TranslationWorker, ImageLoadWorker
 from ui.image_cache import ImageCacheManager
 from engine.translation_controller import TranslationController
 from ui.file_browser import FileBrowser
+from ui.batch import BatchTranslationManager
 
+# 批量翻译耗时提示参数
+BATCH_TIME_THRESHOLD = 15       # 超过此页数弹出耗时提示
+PAGE_AVG_TIME_SEC = 8           # 单页平均耗时（秒，含 API 往返）
 
 
 # ============================================================================
@@ -311,6 +317,11 @@ class MainWindow(QMainWindow):
         self.prefetch_manager.page_completed.connect(self._on_prefetch_page_completed)
         self.prefetch_manager.all_completed.connect(self._on_prefetch_all_completed)
 
+        # === 批量翻译管理器 ===
+        self.batch_manager = BatchTranslationManager(self.translation_cache, max_concurrent=2, parent=self)
+        self.batch_manager.progress_updated.connect(self._on_batch_progress)
+        self.batch_manager.batch_finished.connect(self._on_batch_finished)
+
         # 文件浏览器（替代原来的左侧面板）
         self.file_browser = FileBrowser()
         self.file_browser.file_selected.connect(self.load_image)
@@ -397,6 +408,9 @@ class MainWindow(QMainWindow):
             action = prefetch_menu.addAction(f"下 {n} 页")
             action.setData(n)
             action.triggered.connect(lambda checked, count=n: self._manual_prefetch(count))
+        prefetch_menu.addSeparator()
+        batch_action = prefetch_menu.addAction("批量翻译...")
+        batch_action.triggered.connect(self._show_batch_dialog)
         self.prefetch_btn.setMenu(prefetch_menu)
         tool_row1.addWidget(self.prefetch_btn)
         tool_row1.addStretch()
@@ -496,6 +510,39 @@ class MainWindow(QMainWindow):
         
         right_layout.addWidget(self.right_splitter)
         
+        # --- 批量翻译进度 UI（默认隐藏）---
+        self.batch_progress_frame = QFrame()
+        self.batch_progress_frame.setObjectName("batchProgressFrame")
+        batch_layout = QVBoxLayout(self.batch_progress_frame)
+        batch_layout.setContentsMargins(0, 4, 0, 0)
+
+        # 进度条行
+        progress_row = QHBoxLayout()
+        self.batch_progress_bar = QProgressBar()
+        self.batch_progress_bar.setTextVisible(False)
+        self.batch_progress_bar.setFixedHeight(6)
+        progress_row.addWidget(self.batch_progress_bar, 1)
+        self.batch_progress_label = QLabel("")
+        self.batch_progress_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        progress_row.addWidget(self.batch_progress_label)
+        batch_layout.addLayout(progress_row)
+
+        # 按钮行
+        btn_row = QHBoxLayout()
+        self.batch_pause_btn = QPushButton("暂停")
+        self.batch_pause_btn.setFixedWidth(60)
+        self.batch_pause_btn.clicked.connect(self._on_batch_pause_resume)
+        self.batch_cancel_btn = QPushButton("取消")
+        self.batch_cancel_btn.setFixedWidth(60)
+        self.batch_cancel_btn.clicked.connect(self._on_batch_cancel)
+        btn_row.addStretch()
+        btn_row.addWidget(self.batch_pause_btn)
+        btn_row.addWidget(self.batch_cancel_btn)
+        batch_layout.addLayout(btn_row)
+
+        self.batch_progress_frame.hide()
+        right_layout.addWidget(self.batch_progress_frame)
+
         # --- 骨架屏（翻译等待时覆盖文本区域）---
         self.skeleton_widget = self._create_skeleton()
         right_layout.addWidget(self.skeleton_widget)
@@ -692,7 +739,7 @@ class MainWindow(QMainWindow):
         pixmap = self.image_cache.get(file_path)
         if pixmap is not None:
             self.canvas.load_image(file_path, pixmap=pixmap)
-            self.status_bar.showMessage(f"选中: {os.path.basename(file_path)} (缓存命中)")
+            self.status_bar.showMessage(f"选中: {os.path.basename(file_path)}")
             self._update_page_info()
             self._set_translating(False)
             self._prefetch_adjacent()
@@ -800,7 +847,7 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("已取消本次选区", 3000)
             return
         image_path = self.canvas.current_image_path or ""
-        self.translation_controller.translate_region(image_path, pixmap)
+        self.translation_controller.translate_region(image_path, pixmap, page_index=self.current_file_index)
 
     def _on_translation_stage(self, stage: str):
         self.status_bar.showMessage(stage)
@@ -925,6 +972,149 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("📦 预翻译完成，已缓存", 3000)
         self.prefetch_btn.setText("预翻译")
 
+    # ===================== 批量翻译 =====================
+
+    def _show_batch_dialog(self):
+        """弹出批量翻译范围选择对话框"""
+        total = len(self.file_browser.get_file_paths())
+        if total == 0:
+            self.status_bar.showMessage("请先打开图片文件夹或压缩包", 3000)
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("批量翻译")
+        layout = QVBoxLayout(dlg)
+
+        range_layout = QHBoxLayout()
+        range_layout.addWidget(QLabel("范围: 第"))
+        start_spin = QSpinBox()
+        start_spin.setRange(1, total)
+        start_spin.setValue(1)
+        range_layout.addWidget(start_spin)
+        range_layout.addWidget(QLabel("页 ~ 第"))
+        end_spin = QSpinBox()
+        end_spin.setRange(1, total)
+        end_spin.setValue(total)
+        range_layout.addWidget(end_spin)
+        range_layout.addWidget(QLabel("页"))
+        layout.addLayout(range_layout)
+
+        count_label = QLabel(f"共 0 页")
+        layout.addWidget(count_label)
+
+        def _on_range_changed():
+            s = start_spin.value()
+            e = end_spin.value()
+            if s <= e:
+                count_label.setText(f"共 {e - s + 1} 页")
+            else:
+                count_label.setText(f"共 0 页（起点大于终点）")
+        start_spin.valueChanged.connect(_on_range_changed)
+        end_spin.valueChanged.connect(_on_range_changed)
+        _on_range_changed()
+
+        context_check = QCheckBox("启用上下文连贯")
+        context_check.setChecked(True)
+        layout.addWidget(context_check)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("开始翻译")
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        start, end = start_spin.value() - 1, end_spin.value() - 1  # 转 0-based
+        enable_context = context_check.isChecked()
+
+        if start > end:
+            start, end = end, start
+
+        page_count = end - start + 1
+        if page_count > 50:
+            QMessageBox.warning(self, "范围过大", "单次最多翻译 50 页")
+            return
+
+        # 耗时提示（> 15 页时弹出预估确认）
+        if page_count > BATCH_TIME_THRESHOLD:
+            if not self._confirm_batch_start(page_count):
+                return
+
+        target_paths = self.file_browser.get_file_paths()[start:end+1]
+
+        if enable_context:
+            try:
+                from engine.context import ContextEngine
+                context_engine = ContextEngine(self.translation_cache._db)
+                self.batch_manager.set_context_engine(context_engine)
+            except (ImportError, AttributeError):
+                _logger.warning("ContextEngine 不可用（PDR-03 尚未实现），上下文功能降级")
+
+        self._show_batch_progress()
+        self.batch_manager.start(target_paths, start, end)
+
+    def _confirm_batch_start(self, page_count: int) -> bool:
+        """弹出批量翻译耗时确认对话框，返回是否继续"""
+        concurrency = 2  # 默认并发数
+        estimated_secs = page_count * PAGE_AVG_TIME_SEC / concurrency
+
+        min_min = max(1, int(estimated_secs / 60 * 0.7))
+        max_min = max(1, int(estimated_secs / 60 * 1.3) + 1)
+
+        if max_min <= 1:
+            time_str = "不到 1 分钟"
+        else:
+            time_str = f"{min_min}–{max_min} 分钟"
+
+        msg = (f"将翻译 {page_count} 页\n\n"
+               f"预计约 {time_str}，请耐心等待\n\n"
+               f"提示：可先翻译少量页面，确认翻译质量满意后再继续。")
+
+        reply = QMessageBox.question(
+            self, "批量翻译确认", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
+    def _show_batch_progress(self):
+        """显示批量翻译进度 UI"""
+        self.batch_progress_bar.setValue(0)
+        self.batch_progress_bar.setMaximum(100)
+        self.batch_progress_label.setText("准备中…")
+        self.batch_progress_frame.show()
+
+    def _on_batch_progress(self, completed, total):
+        """批量翻译进度更新回调"""
+        if total > 0:
+            pct = int(completed / total * 100)
+            self.batch_progress_bar.setValue(pct)
+        self.batch_progress_label.setText(f"{completed} / {total} 页已完成")
+
+    def _on_batch_finished(self, success, failed):
+        """批量翻译完成回调"""
+        self.batch_progress_frame.hide()
+        if failed:
+            self.status_bar.showMessage(f"批量翻译完成：{success} 成功，{failed} 失败", 5000)
+        else:
+            self.status_bar.showMessage(f"批量翻译完成：{success} 页", 5000)
+
+    def _on_batch_pause_resume(self):
+        """暂停/恢复切换"""
+        if self.batch_manager.is_paused():
+            self.batch_manager.resume()
+            self.batch_pause_btn.setText("暂停")
+        else:
+            self.batch_manager.pause()
+            self.batch_pause_btn.setText("继续")
+
+    def _on_batch_cancel(self):
+        """取消批量翻译"""
+        self.batch_manager.cancel()
+        self.batch_progress_frame.hide()
+
     def translate_current_page(self):
         """F5 翻译当前页"""
         if not self.canvas.current_image_path:
@@ -932,7 +1122,7 @@ class MainWindow(QMainWindow):
             return
         image_path = self.canvas.current_image_path
         self.prefetch_manager.promote(image_path)
-        self.translation_controller.translate_page(image_path)
+        self.translation_controller.translate_page(image_path, page_index=self.current_file_index)
     
     def keyPressEvent(self, event):
         """键盘快捷键：左右方向键翻页、F5 翻译当前页、Ctrl+Shift+F5 预翻译下 3 页"""
@@ -954,9 +1144,12 @@ class MainWindow(QMainWindow):
         self.file_browser.shutdown()
         # 终止预翻译 worker
         self.prefetch_manager.clear()
+        # 终止批量翻译 worker
+        self.batch_manager.cancel()
         # 终止翻译 worker + 清理临时文件
         self.translation_controller.shutdown()
         # 终止图片缓存管理器中的后台 worker
         self.image_cache.clear()
-        # QA：清理完成，标记关闭事件已接受
+        # 关闭翻译缓存（WAL checkpoint + close，确保数据不丢失）
+        self.translation_cache.close()
         event.accept()

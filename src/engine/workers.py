@@ -20,14 +20,17 @@ class TranslationWorker(QThread):
     status = pyqtSignal(str)                 # （已弃用，保留兼容）
     stage_changed = pyqtSignal(str)          # 阶段变化
 
-    def __init__(self, image_path):
+    def __init__(self, image_path, context=None):
         super().__init__()
         self.image_path = image_path
+        self.context = context
 
     def run(self):
         try:
             self.stage_changed.emit("正在翻译…")
-            origin_text, translated_text, summary_dict = llm_engine.translate_image(self.image_path)
+            origin_text, translated_text, summary_dict = llm_engine.translate_image(
+                self.image_path, context=self.context
+            )
             self.stage_changed.emit("正在解析…")
             self.finished.emit(origin_text, translated_text, summary_dict)
         except Exception as e:

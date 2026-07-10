@@ -43,7 +43,6 @@ def _rotate_logs():
 def setup_logging():
     """初始化日志系统，输出到控制台和文件（自动轮转保留最近10个日志）"""
     LOG_DIR.mkdir(exist_ok=True)
-    _rotate_logs()
     
     # 根 logger 配置
     logger = logging.getLogger("BubbleTrans")
@@ -52,6 +51,9 @@ def setup_logging():
     # 文件 handler — 每次运行新建日志文件，带时间戳
     log_file = LOG_DIR / f"bubbletrans_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     fh = logging.FileHandler(log_file, encoding="utf-8")
+    
+    # 轮转：新日志创建之后再清理旧日志，确保严格保留最近 MAX_LOG_FILES 个
+    _rotate_logs()
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
