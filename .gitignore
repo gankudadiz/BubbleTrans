@@ -4,6 +4,7 @@ translation_cache.db
 translation_cache.db-*
 
 .venv/
+.venv-release/
 venv/
 env/
 
