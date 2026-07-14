@@ -91,8 +91,8 @@ class BatchTranslationManager(QObject):
                 except Exception:
                     pass
 
-            # 处理当前块
-            results = self._process_chunk(chunk_paths, chunk_start_page)
+            # 处理当前块（把前情提要传入 Worker）
+            results = self._process_chunk(chunk_paths, chunk_start_page, context=context)
 
             # 写入缓存 + 更新进度
             for path, result in results.items():
@@ -153,8 +153,12 @@ class BatchTranslationManager(QObject):
         except Exception:
             pass
 
-    def _process_chunk(self, chunk_paths, chunk_start_page):
-        """组内并发翻译：启动所有 worker，高频 poll 等待完成"""
+    def _process_chunk(self, chunk_paths, chunk_start_page, context=None):
+        """组内并发翻译：启动所有 worker，高频 poll 等待完成。
+
+        context 为本 chunk 共享的前情提要文本（通常来自上一 chunk 已写入缓存的 plot）。
+        同 chunk 内页面并发执行，因此共用块开始前构建好的同一份上下文。
+        """
         from engine.workers import TranslationWorker
 
         workers = []
@@ -179,7 +183,8 @@ class BatchTranslationManager(QObject):
                     event.set()
 
         for path in chunk_paths:
-            worker = TranslationWorker(path)
+            # 必须传入 context，否则「启用上下文连贯」只构建不注入
+            worker = TranslationWorker(path, context=context)
             worker.finished.connect(
                 lambda o, t, s, p=path: on_page_done(p, o, t, s)
             )

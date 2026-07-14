@@ -1051,6 +1051,10 @@ class MainWindow(QMainWindow):
                 self.batch_manager.set_context_engine(context_engine)
             except (ImportError, AttributeError):
                 _logger.warning("ContextEngine 不可用（PDR-03 尚未实现），上下文功能降级")
+                self.batch_manager.set_context_engine(None)
+        else:
+            # 取消勾选时清空，避免沿用上一次批量任务残留的引擎
+            self.batch_manager.set_context_engine(None)
 
         self._show_batch_progress()
         self.batch_manager.start(target_paths, start, end)
