@@ -122,6 +122,18 @@ class TranslationCache:
             _logger.info(f"缓存未命中: {os.path.basename(image_path)} (key={key[:8]}...) total={self._db.count()})")
             return None
 
+    def has(self, image_path, mtime) -> bool:
+        """轻量判断是否存在有效翻译缓存（不写日志，供 UI 状态展示使用）"""
+        with self._lock:
+            key = self._make_key(image_path, mtime)
+            entry = self._db.get(key)
+            if entry is None:
+                return False
+            # 与 get() 保持一致：错误缓存视为无缓存
+            if self._is_error_entry(entry):
+                return False
+            return True
+
     def set(self, image_path, mtime, data, page_index=None):
         """
         写入缓存

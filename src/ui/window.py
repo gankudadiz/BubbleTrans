@@ -700,11 +700,14 @@ class MainWindow(QMainWindow):
         image_path = self.canvas.current_image_path
         removed = self.translation_controller.clear_page_cache(image_path)
         if removed:
-            self.status_bar.showMessage("已清除当前页缓存", 3000)
             self.origin_text = ""
             self.translated_text = ""
             self.shared_text_edit.clear()
             self.summary_text_edit.clear()
+            # 清除后刷新左下角标识，避免仍显示「翻译已缓存」
+            self.status_bar.showMessage(
+                self._file_status_message("已清除缓存", image_path), 3000
+            )
         else:
             self.status_bar.showMessage("当前页无缓存", 3000)
 
@@ -725,7 +728,13 @@ class MainWindow(QMainWindow):
             self.translated_text = ""
             self.shared_text_edit.clear()
             self.summary_text_edit.clear()
-            self.status_bar.showMessage(f"已清除 {count} 条翻译缓存", 5000)
+            current_path = self.canvas.current_image_path
+            if current_path:
+                self.status_bar.showMessage(
+                    self._file_status_message(f"已清除全部缓存({count})", current_path), 5000
+                )
+            else:
+                self.status_bar.showMessage(f"已清除 {count} 条翻译缓存", 5000)
 
     # ===================== 槽函数 =====================
 
@@ -739,7 +748,7 @@ class MainWindow(QMainWindow):
         pixmap = self.image_cache.get(file_path)
         if pixmap is not None:
             self.canvas.load_image(file_path, pixmap=pixmap)
-            self.status_bar.showMessage(f"选中: {os.path.basename(file_path)}")
+            self.status_bar.showMessage(self._file_status_message("选中", file_path))
             self._update_page_info()
             self._set_translating(False)
             self._prefetch_adjacent()
@@ -747,9 +756,25 @@ class MainWindow(QMainWindow):
             return
 
         self.canvas.show_placeholder("加载中…")
-        self.status_bar.showMessage(f"加载中: {os.path.basename(file_path)}…")
+        self.status_bar.showMessage(self._file_status_message("加载中", file_path, loading=True))
         self._set_translating(False)
         self.image_cache.load_async(file_path)
+
+    def _has_translation_cache(self, file_path: str) -> bool:
+        """当前图片是否已有有效翻译缓存"""
+        try:
+            mtime = os.path.getmtime(file_path)
+            return self.translation_cache.has(file_path, mtime)
+        except OSError:
+            return False
+
+    def _file_status_message(self, prefix: str, file_path: str, loading: bool = False) -> str:
+        """构建左下角状态栏文件信息；有翻译缓存时附加标识"""
+        name = os.path.basename(file_path)
+        suffix = "…" if loading else ""
+        if self._has_translation_cache(file_path):
+            return f"{prefix}: {name}（翻译已缓存）{suffix}"
+        return f"{prefix}: {name}{suffix}"
 
     def _on_image_cached(self, image_path, pixmap):
         """图片异步解码完成 → 判断是否仍为当前页 → 渲染"""
@@ -758,7 +783,7 @@ class MainWindow(QMainWindow):
             current_path = os.path.join(self.file_browser.current_folder, current_item.text())
             if image_path == current_path:
                 self.canvas.load_image(image_path, pixmap=pixmap)
-                self.status_bar.showMessage(f"已加载: {os.path.basename(image_path)}")
+                self.status_bar.showMessage(self._file_status_message("已加载", image_path))
                 self._update_page_info()
                 self._prefetch_adjacent()
                 self._trigger_auto_prefetch()
