@@ -42,6 +42,9 @@ class FileBrowser(QWidget):
 
     def _build_ui(self):
         """搭建工具栏 + 搜索框 + 文件列表"""
+        # 水平方向不主动抢宽度，避免长文件名把左侧侧边栏撑得很宽
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
@@ -122,6 +125,10 @@ class FileBrowser(QWidget):
 
         # --- 文件列表 ---
         self.file_list = QListWidget()
+        # 长文件名中间省略，不因内容把面板撑宽
+        self.file_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.file_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.file_list.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.file_list.itemClicked.connect(self._on_file_clicked)
         layout.addWidget(self.file_list)
 

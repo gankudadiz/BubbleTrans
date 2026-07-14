@@ -548,10 +548,16 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.skeleton_widget)
         
         splitter.addWidget(right_panel)
-        
-        # 设置分割器初始比例：[200, 600, 300]
-        splitter.setSizes([200, 600, 300])
-        
+
+        # 左侧文件列表默认宽度取「过宽原状」与「过窄 220」的中间值
+        # 长文件名只靠省略显示，不再把左侧 sizeHint 撑得很宽
+        self.file_browser.setMinimumWidth(220)
+        self.file_browser.setMaximumWidth(420)
+        splitter.setStretchFactor(0, 0)  # 左侧不随窗口扩张
+        splitter.setStretchFactor(1, 1)  # 中间画布优先扩展
+        splitter.setStretchFactor(2, 0)  # 右侧固定宽度
+        splitter.setSizes([320, 580, 300])
+
         # 默认选中"译文" tab
         self._switch_tab("trans")
         
