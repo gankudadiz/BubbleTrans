@@ -8,10 +8,10 @@ BubbleTrans - 翻译编排控制器
 
 import os
 import uuid
-import tempfile
 from PyQt6.QtCore import QObject, pyqtSignal
 from engine.llm import llm_engine
 from engine.workers import TranslationWorker
+from utils.paths import get_project_cache_dir
 
 
 class TranslationController(QObject):
@@ -48,7 +48,7 @@ class TranslationController(QObject):
         """翻译框选区域：暂存为临时文件 → 启动 Worker"""
         self._cancel_worker()
         try:
-            temp_dir = tempfile.gettempdir()
+            temp_dir = get_project_cache_dir()
             unique_name = f"bubbletrans_{uuid.uuid4().hex[:8]}.png"
             temp_path = os.path.join(temp_dir, unique_name)
             self._translating_image_path = temp_path
@@ -107,6 +107,7 @@ class TranslationController(QObject):
         self._is_temp_image = False
         self.translating_changed.emit(False)
         self.translation_error.emit(error_msg)
+        self._clean_temp_files()   # 错误路径也清理临时文件（修复残留问题）
         self._cleanup_worker()
 
     def _cancel_worker(self):

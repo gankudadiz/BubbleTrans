@@ -36,7 +36,7 @@ class FileBrowser(QWidget):
         super().__init__(parent)
         self._source_path = ""           # 原始来源（目录或压缩包）
         self._current_folder = ""        # 实际图片目录
-        self._archive_temp_dir = ""      # 压缩包临时解压目录
+        self._archive_temp_dir = ""      # 压缩包解压缓存目录（项目 cache/ 下）
 
         self._build_ui()
 
@@ -203,10 +203,11 @@ class FileBrowser(QWidget):
         save_config({"recent_folders": recent})
 
     def shutdown(self):
-        """关闭时保存阅读位置 + 清理临时目录"""
+        """关闭时保存阅读位置（解压目录保留以便下次复用，不主动清理）"""
         if self._source_path and self.current_file_index >= 0:
             save_last_position(self._source_path, self.current_file_index)
-        self._cleanup_archive_temp()
+        # 不再调用 _cleanup_archive_temp()：
+        # cache/arc_<hash>/ 跨会话保留，供二次打开同一压缩包时复用
 
     # ===================== 内部：打开来源 =====================
 
@@ -230,7 +231,11 @@ class FileBrowser(QWidget):
         # 保存旧来源的阅读位置
         if self._source_path and self.current_file_index >= 0:
             save_last_position(self._source_path, self.current_file_index)
-        self._cleanup_archive_temp()
+
+        # 仅当来源不同时才清理上一个解压目录
+        # 同一压缩包再次打开时跳过清理，让 archive 模块走缓存复用
+        if path != self._source_path:
+            self._cleanup_archive_temp()
 
         self._source_path = path
         if is_archive:
@@ -352,8 +357,9 @@ class FileBrowser(QWidget):
     # ===================== 内部：清理 =====================
 
     def _cleanup_archive_temp(self):
+        """清理上一个压缩包的解压缓存目录（切换来源时调用，shutdown 不调用）"""
         if self._archive_temp_dir and os.path.exists(self._archive_temp_dir):
-            _logger.info(f"_cleanup_archive_temp: 清理临时目录 {self._archive_temp_dir}")
+            _logger.info(f"_cleanup_archive_temp: 清理缓存目录 {self._archive_temp_dir}")
             try:
                 shutil.rmtree(self._archive_temp_dir, ignore_errors=True)
             except Exception as e:
